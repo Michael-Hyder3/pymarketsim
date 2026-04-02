@@ -13,7 +13,8 @@ class LazyGaussianMeanReverting(Fundamental):
         shock_var (float): The variance of the Gaussian shocks.
         shock_mean (float, optional): The mean of the Gaussian shocks. Default is 0.
     """
-    def __init__(self, final_time: int, mean: float, r: float, shock_var: float, shock_mean: float = 0):
+    def __init__(self, final_time: int, mean: float, r: float, shock_var: float, shock_mean: float = 0,
+                 generator: torch.Generator = None):
         self.final_time = final_time
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.r = torch.tensor(r, dtype=torch.float32)
@@ -22,6 +23,7 @@ class LazyGaussianMeanReverting(Fundamental):
         self.shock_var = shock_var
         self.fundamental_values = {0: mean}
         self.latest_t = 0
+        self._generator = generator
 
     def _generate_at(self, t: int):
         """
@@ -32,7 +34,7 @@ class LazyGaussianMeanReverting(Fundamental):
         """
         dt = t - self.latest_t
 
-        shocks = torch.randn(dt) * self.shock_std + self.shock_mean
+        shocks = torch.randn(dt, generator=self._generator) * self.shock_std + self.shock_mean
         weights = torch.pow(1 - self.r, torch.arange(dt, dtype=torch.float32))
         total_shock = torch.sum(weights * shocks)
         value_at_t = (

@@ -34,8 +34,11 @@ class ZIAgent(Agent):
     def take_action(self, side):
         t = self.market.get_time()
         estimate = self.estimate_fundamental()
-        spread = self.shade[1] - self.shade[0]
-        price = estimate + side*spread*random.random() + self.shade[0]
+        shade_max = self.shade[1] if len(self.shade) > 1 else self.shade[0]
+        if side == BUY:
+            price = estimate - random.uniform(0, shade_max)
+        else:
+            price = estimate + random.uniform(0, shade_max)
 
 
         return Order(

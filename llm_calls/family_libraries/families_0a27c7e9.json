@@ -1,0 +1,27 @@
+{
+  "config": {
+    "label": "baseline",
+    "timesteps": 1000,
+    "q_max": 10,
+    "agent_private_values_relative": [
+      631.0449829101562,
+      423.5244445800781,
+      332.5553894042969,
+      254.97203063964844,
+      216.13760375976562,
+      141.75466918945312,
+      118.5871810913086,
+      46.538047790527344,
+      -25.70964813232422,
+      -236.3279571533203
+    ]
+  },
+  "num_families": 5,
+  "families": [
+    "MarketHistory: use market history signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1).",
+    "MarketState: use market state signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1).",
+    "PrivateValue: use private value signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1).",
+    "MarketHistoryAndState: use market history and state signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1).",
+    "MarketHistoryAndPrivateValue: use market history and private value signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1)."
+  ]
+}

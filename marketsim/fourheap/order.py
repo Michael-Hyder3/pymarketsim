@@ -30,6 +30,8 @@ class Order:
         return new_order
 
     def __eq__(self, other: 'Order') -> bool:
+        if other is None:
+            return False
         return self.order_id == other.order_id
 
     def __gt__(self, other: 'Order') -> bool:

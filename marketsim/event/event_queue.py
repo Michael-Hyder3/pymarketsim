@@ -17,10 +17,24 @@ class EventQueue:
         self.scheduled_activities[t].append(order)
 
     def step(self) -> List[Order]:
-        random.shuffle(self.scheduled_activities[self.current_time])
+        # Use the EventQueue's RNG for reproducible shuffling
+        bucket = self.scheduled_activities[self.current_time]
+        try:
+            self.rand.shuffle(bucket)
+        except Exception:
+            random.shuffle(bucket)
+
+        # assign arrival sequence within this timestep so downstream code
+        # can unambiguously determine which order arrived first
+        for idx, order in enumerate(bucket):
+            try:
+                order._arrival_seq = idx
+            except Exception:
+                setattr(order, '_arrival_seq', idx)
+
         self.current_time += 1
 
-        return self.scheduled_activities[self.current_time - 1]
+        return bucket
 
     def get_current_time(self):
         return self.current_time

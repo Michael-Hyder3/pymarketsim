@@ -1,0 +1,65 @@
+{
+  "num_episodes": 1,
+  "episode_count": 1,
+  "buffer": {
+    "size": 1,
+    "max_size": 5,
+    "utilities": [
+      1426.176892256568
+    ],
+    "episodes": [
+      1
+    ],
+    "average_utility": 1426.176892256568,
+    "best_utility": 1426.176892256568
+  },
+  "value_table": {
+    "0a27c7e9": {
+      "config": {
+        "label": "baseline",
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "best_surplus": 1426.176892256568,
+      "history": [
+        {
+          "episode": 1,
+          "surplus": 1426.1769,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"Fallback: fixed shade of 100. Simulator bids pv - 100.\"\"\"\n    return (100, 1)"
+        }
+      ]
+    }
+  },
+  "episode_results": [
+    {
+      "episode_number": 1,
+      "success": true,
+      "utility": 1426.176892256568,
+      "units_executed": 8,
+      "execution_ratio": 0.8,
+      "per_unit_surplus": 178.272111532071,
+      "avg_shade": 178.272111532071,
+      "avg_zi_same_surplus": 741.0211850548337,
+      "strategy_code": "\ndef agent_strategy(private_values, market_history, market_state):\n    \"\"\"Fallback: fixed shade of 100. Simulator bids pv - 100.\"\"\"\n    return (100, 1)\n",
+      "strategy_reasoning": "Fallback: fixed shade of 100. Simulator bids pv - 100.",
+      "config": {
+        "label": "baseline",
+        "timesteps": 1000,
+        "q_max": 10,
+        "agent_private_values_relative": [
+          631.0449829101562,
+          423.5244445800781,
+          332.5553894042969,
+          254.97203063964844,
+          216.13760375976562,
+          141.75466918945312,
+          118.5871810913086,
+          46.538047790527344,
+          -25.70964813232422,
+          -236.3279571533203
+        ]
+      },
+      "diagnostic_summary": null
+    }
+  ]
+}

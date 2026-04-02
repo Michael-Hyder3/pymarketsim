@@ -1,0 +1,1133 @@
+{
+  "num_episodes": 8,
+  "episode_count": 8,
+  "buffer": {
+    "size": 5,
+    "max_size": 5,
+    "utilities": [
+      266.8100127578946,
+      1668.1643081421498,
+      1160.6496549345175,
+      1174.7556154527992,
+      1980.667630545082
+    ],
+    "episodes": [
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "average_utility": 1250.2094443664887,
+    "best_utility": 1980.667630545082
+  },
+  "value_table": {
+    "c34bd6f8": {
+      "config": {
+        "label": "baseline",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "best_surplus": 1668.1643081421498,
+      "best_episode": 5,
+      "recent_history": [
+        {
+          "episode": 1,
+          "surplus": 414.9507,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 100  # Pick a constant shade value"
+        },
+        {
+          "episode": 5,
+          "surplus": 1668.1643,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 50  # Pick a constant shade value"
+        }
+      ]
+    },
+    "c4c37027": {
+      "config": {
+        "label": "large",
+        "num_agents": 21,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "best_surplus": 1328.7796587520133,
+      "best_episode": 2,
+      "recent_history": [
+        {
+          "episode": 2,
+          "surplus": 1328.7797,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing \n    the trade-off between higher shade and fewer executions.\n    \"\"\""
+        },
+        {
+          "episode": 6,
+          "surplus": 1160.6497,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty"
+        }
+      ]
+    },
+    "f90ba7f7": {
+      "config": {
+        "label": "short",
+        "num_agents": 11,
+        "timesteps": 500,
+        "q_max": 10
+      },
+      "best_surplus": 1174.7556154527992,
+      "best_episode": 7,
+      "recent_history": [
+        {
+          "episode": 3,
+          "surplus": 521.2508,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    but with a more conservative approach to avoid over-shading, and fallback to a constant otherwise. \n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\""
+        },
+        {
+          "episode": 7,
+          "surplus": 1174.7556,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid, but adaptively adjust the constant based on market conditions.\n    In this version, the shade is reduced when the market is trending upwards, to avoid over-shading and maximize surplus.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty"
+        }
+      ]
+    },
+    "56665ea7": {
+      "config": {
+        "label": "tight_shade",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "best_surplus": 1980.667630545082,
+      "best_episode": 8,
+      "recent_history": [
+        {
+          "episode": 4,
+          "surplus": 266.81,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    but with a more aggressive approach to maximize surplus, and fallback to a constant otherwise. \n    This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions.\n    \"\"\""
+        },
+        {
+          "episode": 8,
+          "surplus": 1980.6676,
+          "code_snippet": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty"
+        }
+      ]
+    }
+  },
+  "episode_results": [
+    {
+      "episode_number": 1,
+      "success": true,
+      "utility": 414.95074462890625,
+      "units_executed": 1,
+      "execution_ratio": 0.1,
+      "per_unit_surplus": 414.95074462890625,
+      "avg_shade": 414.95074462890625,
+      "avg_zi_same_surplus": 945.8030883123632,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 100  # Pick a constant shade value\n    return (max_bid - shade, 1)  # Always bid max_bid minus shade",
+      "strategy_reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).",
+      "config": {
+        "label": "baseline",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 414.9507,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data)."
+          }
+        ],
+        "winner_surplus": 414.95074462890625,
+        "winner_result": {
+          "llm_surplus": 414.95074462890625,
+          "llm_units_executed": 1,
+          "llm_units_available": 10,
+          "per_unit_surplus": 414.95074462890625,
+          "avg_shade": 414.95074462890625,
+          "avg_zi_same_surplus": 945.8030883123632,
+          "llm_private_values_relative": [
+            314.95074462890625,
+            312.6471862792969,
+            151.19602966308594,
+            124.96141815185547,
+            64.72730255126953,
+            -100.92189025878906,
+            -190.07968139648438,
+            -261.48992919921875,
+            -308.344970703125,
+            -680.0537719726562
+          ],
+          "episode_stats": {
+            "total_trades": 23,
+            "execution_ratio": 0.1
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 23,
+            "agent_transactions": 1,
+            "agent_total_surplus": 414.9507,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 14,
+                "price_relative": -100.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -100.0,
+                  "max_bid_relative": 314.9507,
+                  "shade_used": 414.9507,
+                  "surplus_earned": 414.9507
+                }
+              }
+            ]
+          }
+        },
+        "seed": 17352
+      }
+    },
+    {
+      "episode_number": 2,
+      "success": true,
+      "utility": 1328.7796587520133,
+      "units_executed": 6,
+      "execution_ratio": 0.6,
+      "per_unit_surplus": 221.4632764586689,
+      "avg_shade": 221.46327645866972,
+      "avg_zi_same_surplus": 1009.0188061540175,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing \n    the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state['max_bid']\n    best_bid = market_state.get('best_bid', None)\n    best_ask = market_state.get('best_ask', None)\n    if best_bid is not None and best_ask is not None:\n        shade = (best_ask - best_bid) * 0.5  # 50% of the spread\n    else:\n        shade = 50  # Default to a constant shade value\n    return (max_bid - shade, 1)",
+      "strategy_reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions.",
+      "config": {
+        "label": "large",
+        "num_agents": 21,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 928.7916,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid, with a slight adjustment based on the current market state. This adjustment is designed to take advantage of opportunities to earn surplus when the market is more competitive."
+          },
+          {
+            "candidate": 2,
+            "surplus": 1226.5437,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data)."
+          },
+          {
+            "candidate": 3,
+            "surplus": 1328.7797,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions."
+          }
+        ],
+        "winner_surplus": 1328.7796587520133,
+        "winner_result": {
+          "llm_surplus": 1328.7796587520133,
+          "llm_units_executed": 6,
+          "llm_units_available": 10,
+          "per_unit_surplus": 221.4632764586689,
+          "avg_shade": 221.46327645866972,
+          "avg_zi_same_surplus": 1009.0188061540175,
+          "llm_private_values_relative": [
+            371.4291076660156,
+            269.4212951660156,
+            205.87876892089844,
+            162.3619842529297,
+            150.60458374023438,
+            27.705507278442383,
+            -102.13664245605469,
+            -217.36215209960938,
+            -444.6591796875,
+            -597.5167846679688
+          ],
+          "episode_stats": {
+            "total_trades": 59,
+            "execution_ratio": 0.6
+          },
+          "market_config": {
+            "num_zi_buy": 10,
+            "num_zi_sell": 10,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 59,
+            "agent_transactions": 6,
+            "agent_total_surplus": 1328.7797,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 7,
+                "price_relative": 151.5626,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 151.5626,
+                  "max_bid_relative": 371.4291,
+                  "shade_used": 219.8665,
+                  "surplus_earned": 219.8665
+                }
+              },
+              {
+                "time": 16,
+                "price_relative": -289.7168,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 219.4213,
+                  "max_bid_relative": 269.4213,
+                  "shade_used": 50.0,
+                  "surplus_earned": 559.1381
+                }
+              },
+              {
+                "time": 26,
+                "price_relative": -95.169,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 155.8788,
+                  "max_bid_relative": 205.8788,
+                  "shade_used": 50.0,
+                  "surplus_earned": 301.0477
+                }
+              },
+              {
+                "time": 30,
+                "price_relative": 19.9738,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 19.9738,
+                  "max_bid_relative": 162.362,
+                  "shade_used": 142.3882,
+                  "surplus_earned": 142.3882
+                }
+              },
+              {
+                "time": 45,
+                "price_relative": 103.1642,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 103.1642,
+                  "max_bid_relative": 150.6046,
+                  "shade_used": 47.4403,
+                  "surplus_earned": 47.4403
+                }
+              },
+              {
+                "time": 71,
+                "price_relative": -31.1933,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -31.1933,
+                  "max_bid_relative": 27.7055,
+                  "shade_used": 58.8988,
+                  "surplus_earned": 58.8988
+                }
+              }
+            ]
+          }
+        },
+        "seed": 22567
+      }
+    },
+    {
+      "episode_number": 3,
+      "success": true,
+      "utility": 521.2507756747073,
+      "units_executed": 4,
+      "execution_ratio": 0.4,
+      "per_unit_surplus": 130.3126939186768,
+      "avg_shade": 130.312693918677,
+      "avg_zi_same_surplus": 1280.5180508373073,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    but with a more conservative approach to avoid over-shading, and fallback to a constant otherwise. \n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    best_bid = market_state.get('best_bid', None)\n    best_ask = market_state.get('best_ask', None)\n    if best_bid is not None and best_ask is not None:\n        shade = min((best_ask - best_bid) * 0.2, 50)  # 20% of the spread, capped at 50\n    else:\n        shade = 20  # Default to a constant shade value\n    return (max_bid - shade, 1)",
+      "strategy_reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, but with a more conservative approach to avoid over-shading, and fallback to a constant otherwise. This strategy aims to balance the trade-off between higher shade and fewer executions.",
+      "config": {
+        "label": "short",
+        "num_agents": 11,
+        "timesteps": 500,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 521.2508,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, but with a more conservative approach to avoid over-shading, and fallback to a constant otherwise. This strategy aims to balance the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 2,
+            "surplus": 408.0211,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to achieve a balance between profit per unit and execution frequency."
+          },
+          {
+            "candidate": 3,
+            "surplus": 421.6573,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions."
+          }
+        ],
+        "winner_surplus": 521.2507756747073,
+        "winner_result": {
+          "llm_surplus": 521.2507756747073,
+          "llm_units_executed": 4,
+          "llm_units_available": 10,
+          "per_unit_surplus": 130.3126939186768,
+          "avg_shade": 130.312693918677,
+          "avg_zi_same_surplus": 1280.5180508373073,
+          "llm_private_values_relative": [
+            260.2994689941406,
+            47.72161102294922,
+            42.458213806152344,
+            17.576074600219727,
+            -102.05532836914062,
+            -160.5034637451172,
+            -312.1325988769531,
+            -366.9684753417969,
+            -418.7467956542969,
+            -751.7208251953125
+          ],
+          "episode_stats": {
+            "total_trades": 25,
+            "execution_ratio": 0.4
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 500,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 25,
+            "agent_transactions": 4,
+            "agent_total_surplus": 521.2508,
+            "timesteps": 500,
+            "transactions": [
+              {
+                "time": 7,
+                "price_relative": -21.7868,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -20.0,
+                  "max_bid_relative": 260.2995,
+                  "shade_used": 280.2995,
+                  "surplus_earned": 282.0863
+                }
+              },
+              {
+                "time": 22,
+                "price_relative": -20.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -20.0,
+                  "max_bid_relative": 47.7216,
+                  "shade_used": 67.7216,
+                  "surplus_earned": 67.7216
+                }
+              },
+              {
+                "time": 33,
+                "price_relative": -91.4086,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -20.0,
+                  "max_bid_relative": 42.4582,
+                  "shade_used": 62.4582,
+                  "surplus_earned": 133.8668
+                }
+              },
+              {
+                "time": 107,
+                "price_relative": -20.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -13.1853,
+                  "max_bid_relative": 17.5761,
+                  "shade_used": 30.7613,
+                  "surplus_earned": 37.5761
+                }
+              }
+            ]
+          }
+        },
+        "seed": 30679
+      }
+    },
+    {
+      "episode_number": 4,
+      "success": true,
+      "utility": 266.8100127578946,
+      "units_executed": 3,
+      "execution_ratio": 0.3,
+      "per_unit_surplus": 88.9366709192982,
+      "avg_shade": 88.93667091929832,
+      "avg_zi_same_surplus": 719.3690273998975,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, \n    but with a more aggressive approach to maximize surplus, and fallback to a constant otherwise. \n    This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state['max_bid']\n    best_bid = market_state.get('best_bid', None)\n    best_ask = market_state.get('best_ask', None)\n    if best_bid is not None and best_ask is not None:\n        shade = (best_ask - best_bid) * 0.75  # 75% of the spread, more aggressive\n    else:\n        shade = 75  # Default to a constant shade value\n    return (max_bid - shade, 1)",
+      "strategy_reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, but with a more aggressive approach to maximize surplus, and fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions.",
+      "config": {
+        "label": "tight_shade",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 266.81,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, but with a more aggressive approach to maximize surplus, and fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 2,
+            "surplus": 0.0,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). In this case, we're using a shade of 150, which is carefully chosen based on market data."
+          },
+          {
+            "candidate": 3,
+            "surplus": 0.0,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise."
+          }
+        ],
+        "winner_surplus": 266.8100127578946,
+        "winner_result": {
+          "llm_surplus": 266.8100127578946,
+          "llm_units_executed": 3,
+          "llm_units_available": 10,
+          "per_unit_surplus": 88.9366709192982,
+          "avg_shade": 88.93667091929832,
+          "avg_zi_same_surplus": 719.3690273998975,
+          "llm_private_values_relative": [
+            294.1380920410156,
+            201.46067810058594,
+            62.85115432739258,
+            -100.8753890991211,
+            -120.59574127197266,
+            -155.66505432128906,
+            -310.2006530761719,
+            -334.78765869140625,
+            -547.3479614257812,
+            -613.0287475585938
+          ],
+          "episode_stats": {
+            "total_trades": 26,
+            "execution_ratio": 0.3
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              250
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 26,
+            "agent_transactions": 3,
+            "agent_total_surplus": 266.81,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 27,
+                "price_relative": 113.2921,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 153.0445,
+                  "max_bid_relative": 294.1381,
+                  "shade_used": 141.0936,
+                  "surplus_earned": 180.846
+                }
+              },
+              {
+                "time": 50,
+                "price_relative": 126.4607,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 113.2921,
+                  "max_bid_relative": 201.4607,
+                  "shade_used": 88.1686,
+                  "surplus_earned": 75.0
+                }
+              },
+              {
+                "time": 110,
+                "price_relative": 51.8871,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": 113.2921,
+                  "max_bid_relative": 62.8512,
+                  "shade_used": -50.4409,
+                  "surplus_earned": 10.964
+                }
+              }
+            ]
+          }
+        },
+        "seed": 49479
+      }
+    },
+    {
+      "episode_number": 5,
+      "success": true,
+      "utility": 1668.1643081421498,
+      "units_executed": 6,
+      "execution_ratio": 0.6,
+      "per_unit_surplus": 278.0273846903583,
+      "avg_shade": 278.0273846903572,
+      "avg_zi_same_surplus": 969.9093718373158,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 50  # Pick a constant shade value\n    return (max_bid - shade, 1)  # Always bid max_bid minus shade",
+      "strategy_reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).",
+      "config": {
+        "label": "baseline",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 1558.1643,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, but with a more conservative approach to avoid over-shading, and fallback to a constant otherwise. This strategy aims to balance the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 2,
+            "surplus": 1668.1643,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data)."
+          },
+          {
+            "candidate": 3,
+            "surplus": 688.7464,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise."
+          }
+        ],
+        "winner_surplus": 1668.1643081421498,
+        "winner_result": {
+          "llm_surplus": 1668.1643081421498,
+          "llm_units_executed": 6,
+          "llm_units_available": 10,
+          "per_unit_surplus": 278.0273846903583,
+          "avg_shade": 278.0273846903572,
+          "avg_zi_same_surplus": 969.9093718373158,
+          "llm_private_values_relative": [
+            437.0353698730469,
+            436.843017578125,
+            280.2410583496094,
+            41.65814208984375,
+            -19.321992874145508,
+            -54.33130645751953,
+            -83.44829559326172,
+            -199.4088592529297,
+            -292.5764465332031,
+            -392.44805908203125
+          ],
+          "episode_stats": {
+            "total_trades": 26,
+            "execution_ratio": 0.6
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 26,
+            "agent_transactions": 6,
+            "agent_total_surplus": 1668.1643,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 7,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 437.0354,
+                  "shade_used": 487.0354,
+                  "surplus_earned": 487.0354
+                }
+              },
+              {
+                "time": 22,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 436.843,
+                  "shade_used": 486.843,
+                  "surplus_earned": 486.843
+                }
+              },
+              {
+                "time": 47,
+                "price_relative": -164.7113,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 280.2411,
+                  "shade_used": 330.2411,
+                  "surplus_earned": 444.9524
+                }
+              },
+              {
+                "time": 55,
+                "price_relative": -176.9974,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 41.6581,
+                  "shade_used": 91.6581,
+                  "surplus_earned": 218.6555
+                }
+              },
+              {
+                "time": 60,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": -19.322,
+                  "shade_used": 30.678,
+                  "surplus_earned": 30.678
+                }
+              },
+              {
+                "time": 84,
+                "price_relative": -54.3313,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": -54.3313,
+                  "shade_used": -4.3313,
+                  "surplus_earned": 0.0
+                }
+              }
+            ]
+          }
+        },
+        "seed": 57352
+      }
+    },
+    {
+      "episode_number": 6,
+      "success": true,
+      "utility": 1160.6496549345175,
+      "units_executed": 6,
+      "execution_ratio": 0.6,
+      "per_unit_surplus": 193.4416091557529,
+      "avg_shade": 193.4416091557539,
+      "avg_zi_same_surplus": 1348.1923043521515,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 50  # Pick a constant shade value\n    return (max_bid - shade, 1)",
+      "strategy_reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to balance the trade-off between higher shade and fewer executions.",
+      "config": {
+        "label": "large",
+        "num_agents": 21,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 423.0764,
+            "reasoning": "Refined fixed shade strategy: adjust the shade based on the spread to avoid over-shading."
+          },
+          {
+            "candidate": 2,
+            "surplus": 1160.6497,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to balance the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 3,
+            "surplus": 763.2079,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to maximize the profit per unit while balancing the trade-off between higher shade and fewer executions."
+          }
+        ],
+        "winner_surplus": 1160.6496549345175,
+        "winner_result": {
+          "llm_surplus": 1160.6496549345175,
+          "llm_units_executed": 6,
+          "llm_units_available": 10,
+          "per_unit_surplus": 193.4416091557529,
+          "avg_shade": 193.4416091557539,
+          "avg_zi_same_surplus": 1348.1923043521515,
+          "llm_private_values_relative": [
+            372.55609130859375,
+            222.33778381347656,
+            214.34857177734375,
+            -21.64212989807129,
+            -44.20935821533203,
+            -104.07107543945312,
+            -150.10968017578125,
+            -275.4429931640625,
+            -324.4336853027344,
+            -345.3374938964844
+          ],
+          "episode_stats": {
+            "total_trades": 58,
+            "execution_ratio": 0.6
+          },
+          "market_config": {
+            "num_zi_buy": 10,
+            "num_zi_sell": 10,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 58,
+            "agent_transactions": 6,
+            "agent_total_surplus": 1160.6497,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 19,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 372.5561,
+                  "shade_used": 422.5561,
+                  "surplus_earned": 422.5561
+                }
+              },
+              {
+                "time": 25,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 222.3378,
+                  "shade_used": 272.3378,
+                  "surplus_earned": 272.3378
+                }
+              },
+              {
+                "time": 39,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 214.3486,
+                  "shade_used": 264.3486,
+                  "surplus_earned": 264.3486
+                }
+              },
+              {
+                "time": 81,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": -21.6421,
+                  "shade_used": 28.3579,
+                  "surplus_earned": 28.3579
+                }
+              },
+              {
+                "time": 107,
+                "price_relative": -217.2587,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": -44.2094,
+                  "shade_used": 5.7906,
+                  "surplus_earned": 173.0493
+                }
+              },
+              {
+                "time": 137,
+                "price_relative": -104.0711,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": -104.0711,
+                  "shade_used": -54.0711,
+                  "surplus_earned": 0.0
+                }
+              }
+            ]
+          }
+        },
+        "seed": 62567
+      }
+    },
+    {
+      "episode_number": 7,
+      "success": true,
+      "utility": 1174.7556154527992,
+      "units_executed": 3,
+      "execution_ratio": 0.3,
+      "per_unit_surplus": 391.58520515093306,
+      "avg_shade": 391.58520515093164,
+      "avg_zi_same_surplus": 1266.1592479552492,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid, but adaptively adjust the constant based on market conditions.\n    In this version, the shade is reduced when the market is trending upwards, to avoid over-shading and maximize surplus.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    best_bid = market_state.get('best_bid', None)\n    best_ask = market_state.get('best_ask', None)\n    shade = 50  # Initial constant shade value\n    if best_ask is not None and best_bid is not None and best_ask > best_bid:\n        # Market is trending upwards, reduce shade to avoid over-shading\n        shade *= 0.8\n    return (max_bid - shade, 1)  # Always bid max_bid minus shade",
+      "strategy_reasoning": "Fixed shade: always subtract a constant amount from max_bid, but adaptively adjust the constant based on market conditions. In this version, the shade is reduced when the market is trending upwards, to avoid over-shading and maximize surplus.",
+      "config": {
+        "label": "short",
+        "num_agents": 11,
+        "timesteps": 500,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 1174.7556,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid, but adaptively adjust the constant based on market conditions. In this version, the shade is reduced when the market is trending upwards, to avoid over-shading and maximize surplus."
+          },
+          {
+            "candidate": 2,
+            "surplus": 942.3909,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to balance the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 3,
+            "surplus": 1040.0334,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to balance the trade-off between higher shade and fewer executions."
+          }
+        ],
+        "winner_surplus": 1174.7556154527992,
+        "winner_result": {
+          "llm_surplus": 1174.7556154527992,
+          "llm_units_executed": 3,
+          "llm_units_available": 10,
+          "per_unit_surplus": 391.58520515093306,
+          "avg_shade": 391.58520515093164,
+          "avg_zi_same_surplus": 1266.1592479552492,
+          "llm_private_values_relative": [
+            430.42974853515625,
+            289.61126708984375,
+            192.3646697998047,
+            137.09239196777344,
+            98.88970947265625,
+            -129.65118408203125,
+            -175.049072265625,
+            -180.2069549560547,
+            -192.45091247558594,
+            -391.1684875488281
+          ],
+          "episode_stats": {
+            "total_trades": 27,
+            "execution_ratio": 0.3
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 500,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              500
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 27,
+            "agent_transactions": 3,
+            "agent_total_surplus": 1174.7556,
+            "timesteps": 500,
+            "transactions": [
+              {
+                "time": 37,
+                "price_relative": -93.9591,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 430.4297,
+                  "shade_used": 480.4297,
+                  "surplus_earned": 524.3888
+                }
+              },
+              {
+                "time": 115,
+                "price_relative": -128.3908,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -40.0,
+                  "max_bid_relative": 289.6113,
+                  "shade_used": 329.6113,
+                  "surplus_earned": 418.0021
+                }
+              },
+              {
+                "time": 143,
+                "price_relative": -40.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -40.0,
+                  "max_bid_relative": 192.3647,
+                  "shade_used": 232.3647,
+                  "surplus_earned": 232.3647
+                }
+              }
+            ]
+          }
+        },
+        "seed": 70679
+      }
+    },
+    {
+      "episode_number": 8,
+      "success": true,
+      "utility": 1980.667630545082,
+      "units_executed": 4,
+      "execution_ratio": 0.4,
+      "per_unit_surplus": 495.1669076362705,
+      "avg_shade": 495.16690763627025,
+      "avg_zi_same_surplus": 1655.2090567169216,
+      "strategy_code": "def agent_strategy(private_values, market_history, market_state):\n    \"\"\"\n    Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data).\n    This strategy aims to balance the trade-off between higher shade and fewer executions.\n    \"\"\"\n    max_bid = market_state.get('q_max', 0)  # Get max_bid from market_state, default to 0 if empty\n    shade = 50  # Pick a constant shade value\n    return (max_bid - shade, 1)",
+      "strategy_reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to balance the trade-off between higher shade and fewer executions.",
+      "config": {
+        "label": "tight_shade",
+        "num_agents": 11,
+        "timesteps": 1000,
+        "q_max": 10
+      },
+      "diagnostic_summary": {
+        "diagnostic_results": [
+          {
+            "candidate": 1,
+            "surplus": 1595.5434,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). In this version, the shade is reduced when the market is trending upwards, to avoid over-shading and maximize surplus."
+          },
+          {
+            "candidate": 2,
+            "surplus": 1980.6676,
+            "reasoning": "Fixed shade: always subtract a constant amount from max_bid (pick the constant carefully based on market data). This strategy aims to balance the trade-off between higher shade and fewer executions."
+          },
+          {
+            "candidate": 3,
+            "surplus": 575.6159,
+            "reasoning": "Spread-based bidding strategy: shade proportional to (best_ask - best_bid) when the spread is available, fallback to a constant otherwise. This strategy aims to balance the trade-off between higher shade and fewer executions."
+          }
+        ],
+        "winner_surplus": 1980.667630545082,
+        "winner_result": {
+          "llm_surplus": 1980.667630545082,
+          "llm_units_executed": 4,
+          "llm_units_available": 10,
+          "per_unit_surplus": 495.1669076362705,
+          "avg_shade": 495.16690763627025,
+          "avg_zi_same_surplus": 1655.2090567169216,
+          "llm_private_values_relative": [
+            636.8585815429688,
+            496.6869201660156,
+            351.99786376953125,
+            271.5062561035156,
+            54.39741134643555,
+            28.68692398071289,
+            -283.3438720703125,
+            -341.1219177246094,
+            -426.70648193359375,
+            -612.7606811523438
+          ],
+          "episode_stats": {
+            "total_trades": 30,
+            "execution_ratio": 0.4
+          },
+          "market_config": {
+            "num_zi_buy": 5,
+            "num_zi_sell": 5,
+            "timesteps": 1000,
+            "q_max": 10,
+            "pv_var": 100000.0,
+            "shade_range": [
+              0,
+              250
+            ]
+          },
+          "diagnostic_json": {
+            "agent_type": "buyer",
+            "total_transactions": 30,
+            "agent_transactions": 4,
+            "agent_total_surplus": 1980.6676,
+            "timesteps": 1000,
+            "transactions": [
+              {
+                "time": 28,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 636.8586,
+                  "shade_used": 686.8586,
+                  "surplus_earned": 686.8586
+                }
+              },
+              {
+                "time": 40,
+                "price_relative": -73.618,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 496.6869,
+                  "shade_used": 546.6869,
+                  "surplus_earned": 570.3049
+                }
+              },
+              {
+                "time": 48,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 351.9979,
+                  "shade_used": 401.9979,
+                  "surplus_earned": 401.9979
+                }
+              },
+              {
+                "time": 82,
+                "price_relative": -50.0,
+                "agent_involved": true,
+                "agent_action": {
+                  "submitted_price_relative": -50.0,
+                  "max_bid_relative": 271.5063,
+                  "shade_used": 321.5063,
+                  "surplus_earned": 321.5063
+                }
+              }
+            ]
+          }
+        },
+        "seed": 89479
+      }
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "calculate_agent_surplus_iter1": {
+    "timestamp": "2026-02-23T15:11:27.938440",
+    "iteration": 1,
+    "function_name": "calculate_agent_surplus",
+    "task_description": "Calculate the surplus (profit) achieved by an agent from their trades",
+    "success": true,
+    "error_feedback": null,
+    "code_file": "llm_calls/iteration_1/calculate_agent_surplus.py",
+    "market_summary": {
+      "total_transactions": 141,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "suggest_shading_region_iter1": {
+    "timestamp": "2026-02-24T08:45:07.703548",
+    "iteration": 1,
+    "function_name": "suggest_shading_region",
+    "task_description": "Return a simple shading region for a ZI buyer: always [0, X] for some positive X.",
+    "success": true,
+    "error_feedback": null,
+    "code_file": "llm_calls/iteration_1/suggest_shading_region.py",
+    "market_summary": {
+      "total_transactions": 141,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "suggest_shading_region_iter2": {
+    "timestamp": "2026-02-24T08:11:42.794817",
+    "iteration": 2,
+    "function_name": "suggest_shading_region",
+    "task_description": "Return a simple shading region for a ZI buyer: always [0, X] for some positive X.",
+    "success": true,
+    "error_feedback": "Test failed: FAILED: test_mixed_positive_negative (test_suggest_shading_region.TestSuggestShadingRegion) AssertionError: 0.0 not greater than 0 : X (region[1]) should be positive even for negative private values",
+    "code_file": "llm_calls/iteration_2/suggest_shading_region.py",
+    "market_summary": {
+      "total_transactions": 141,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "create_timestep_schedule_iter1": {
+    "timestamp": "2026-02-24T10:09:40.535925",
+    "iteration": 1,
+    "function_name": "create_timestep_schedule",
+    "task_description": "Create a timestep-based shading schedule for an agent.",
+    "success": true,
+    "error_feedback": null,
+    "code_file": "llm_calls/iteration_1/create_timestep_schedule.py",
+    "market_summary": {
+      "total_transactions": 141,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "agent_strategy_iter1": {
+    "timestamp": "2026-03-03T07:22:35.650512",
+    "iteration": 1,
+    "function_name": "agent_strategy",
+    "task_description": "You are a buyer in a continuous double auction. Recent market prices: [99469.3, 100181.8]. Private values (highest first): [100.0, 95.0, 90.0, 85.0, 80.0]. Constraint: bid price <= private_values[0]. Write a Python function named agent_strategy that returns a (price, quantity) tuple or None.",
+    "success": false,
+    "error_feedback": null,
+    "code_file": "llm_calls/iteration_1/agent_strategy.py",
+    "market_summary": {
+      "total_transactions": 146,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "agent_strategy_iter2": {
+    "timestamp": "2026-03-03T07:19:32.991838",
+    "iteration": 2,
+    "function_name": "agent_strategy",
+    "task_description": "The previous strategy implementation failed with this error:\n\nNo 'agent_strategy' function defined\n\nPlease fix the code and generate a corrected implementation:\n\n```python\ndef agent_strategy(private_values, market_history, market_state):\n    \"\"\"Fixed strategy that handles the error above.\"\"\"\n    pass\n```\n",
+    "success": false,
+    "error_feedback": "No 'agent_strategy' function defined",
+    "code_file": "llm_calls/iteration_2/agent_strategy.py",
+    "market_summary": {
+      "total_transactions": 146,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  },
+  "agent_strategy_iter3": {
+    "timestamp": "2026-03-03T07:19:33.013566",
+    "iteration": 3,
+    "function_name": "agent_strategy",
+    "task_description": "The previous strategy implementation failed with this error:\n\nNo 'agent_strategy' function defined\n\nPlease fix the code and generate a corrected implementation:\n\n```python\ndef agent_strategy(private_values, market_history, market_state):\n    \"\"\"Fixed strategy that handles the error above.\"\"\"\n    pass\n```\n",
+    "success": false,
+    "error_feedback": "No 'agent_strategy' function defined",
+    "code_file": "llm_calls/iteration_3/agent_strategy.py",
+    "market_summary": {
+      "total_transactions": 146,
+      "timesteps": 10000,
+      "num_agents": 0
+    }
+  }
+}

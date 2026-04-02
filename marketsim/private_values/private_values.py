@@ -68,3 +68,44 @@ class PrivateValues:
             value -= -1*min(0, position)*self.extra_sell
         return value
     
+    def consume_marginal(self, position: int, order_type: int):
+        """
+        Remove (consume) the marginal private value used for a trade at the given
+        position and order type. Returns the removed marginal value or None if
+        index out of range.
+
+        The internal rule for indexing is the same as `value_for_exchange`:
+        index = position + offset - (1 if SELL else 0).
+
+        If the removed index is strictly less than `offset`, the `offset` is
+        decremented so indexing remains consistent for the remaining values.
+        """
+        index = position + self.offset - (1 if order_type == SELL else 0)
+        if index < 0 or index >= len(self.values):
+            return None
+
+        removed_val = self.values[index].item()
+
+        # remove the element from the tensor
+        if index == 0:
+            new_values = self.values[1:]
+        elif index == len(self.values) - 1:
+            new_values = self.values[:-1]
+        else:
+            new_values = torch.cat((self.values[:index], self.values[index+1:]))
+
+        # if we removed from the left side (seller region), shift offset left
+        if index < self.offset:
+            self.offset -= 1
+
+        self.values = new_values
+
+        # update extra_buy/extra_sell safely
+        if len(self.values) == 0:
+            self.extra_buy = 0
+            self.extra_sell = 0
+        else:
+            self.extra_buy = min(self.values[-1].item(), 0)
+            self.extra_sell = max(self.values[0].item(), 0)
+
+        return removed_val

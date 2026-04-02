@@ -1,0 +1,8 @@
+{
+  "entries_count": 1,
+  "raw_desc_count": 1,
+  "sanitized_count": 1,
+  "raw_desc": [
+    "MarketStateBased: use market state based signals available at runtime to choose an adaptive but simple ZI-style shade. Return (shade, 1)."
+  ]
+}
