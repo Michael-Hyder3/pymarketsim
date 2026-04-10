@@ -5,11 +5,11 @@ from marketsim.fourheap import constants
 
 
 class Market:
-    def __init__(self, fundamental: Fundamental, time_steps):
+    def __init__(self, fundamental: Fundamental, time_steps, rand_seed: int = None):
         self.order_book = FourHeap()
         self.matched_orders = []
         self.fundamental = fundamental
-        self.event_queue = EventQueue()
+        self.event_queue = EventQueue(rand_seed=rand_seed)
         self.end_time = time_steps
 
 
@@ -55,8 +55,8 @@ class Market:
     def get_midprices(self):
         return self.order_book.midprices
 
-    def reset(self, fundamental):
+    def reset(self, fundamental, rand_seed: int = None):
         self.order_book = FourHeap()
         self.matched_orders = []
-        self.event_queue = EventQueue()
+        self.event_queue = EventQueue(rand_seed=rand_seed)
         self.fundamental = fundamental

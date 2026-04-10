@@ -30,62 +30,84 @@ class FourHeap:
         order_matched = self.sell_matched if order.order_type == constants.SELL else self.buy_matched
         counter_matched = self.sell_matched if order.order_type == constants.BUY else self.buy_matched
         counter_unmatched = self.sell_unmatched if order.order_type == constants.BUY else self.buy_unmatched
+        order_unmatched = self.sell_unmatched if order.order_type == constants.SELL else self.buy_unmatched
 
         to_match = counter_unmatched.push_to()
-        if to_match is not None:
-            to_match_quantity = to_match.quantity
-            if to_match_quantity == q_order:
-                order_matched.add_order(order)
-                counter_matched.add_order(to_match)
-            elif to_match_quantity > q_order:
-                excess_order = to_match.copy_and_decrease(q_order)
-                order_matched.add_order(order)
-                counter_matched.add_order(to_match)
-                counter_unmatched.add_order(excess_order)
-            elif q_order > to_match_quantity:
-                # There's a better way to do this, but I think it's not worth it
-                counter_matched.add_order(to_match)
-                new_order = order.copy_and_decrease(to_match_quantity)
-                order_matched.add_order(order)
-                self.insert(new_order)
+        if to_match is None:
+            order_unmatched.add_order(order)
+            return None
+
+        to_match_quantity = to_match.quantity
+        if to_match_quantity == q_order:
+            order_matched.add_order(order)
+            counter_matched.add_order(to_match)
+            return None
+        elif to_match_quantity > q_order:
+            excess_order = to_match.copy_and_decrease(q_order)
+            order_matched.add_order(order)
+            counter_matched.add_order(to_match)
+            counter_unmatched.add_order(excess_order)
+            return None
+        elif q_order > to_match_quantity:
+            counter_matched.add_order(to_match)
+            new_order = order.copy_and_decrease(to_match_quantity)
+            order_matched.add_order(order)
+            return new_order
+        return None
 
     def handle_replace(self, order):
         matched = self.sell_matched if order.order_type == constants.SELL else self.buy_matched
         unmatched = self.sell_unmatched if order.order_type == constants.SELL else self.buy_unmatched
         q_order = order.quantity
         replaced = matched.push_to()
-        if replaced is not None:
-            replaced_quantity = replaced.quantity
-            if replaced_quantity == q_order:
-                matched.add_order(order)
-                unmatched.add_order(replaced)
-            elif replaced_quantity > q_order:
-                matched.add_order(order)
-                matched_s = replaced.copy_and_decrease(q_order)
-                matched.add_order(matched_s)
-                unmatched.add_order(replaced)
-            elif replaced_quantity < q_order:
-                new_order = order.copy_and_decrease(replaced_quantity)
-                matched.add_order(order)
-                unmatched.add_order(replaced)
-                self.insert(new_order)
+        if replaced is None:
+            unmatched.add_order(order)
+            return None
+
+        replaced_quantity = replaced.quantity
+        if replaced_quantity == q_order:
+            matched.add_order(order)
+            unmatched.add_order(replaced)
+            return None
+        elif replaced_quantity > q_order:
+            matched.add_order(order)
+            matched_s = replaced.copy_and_decrease(q_order)
+            matched.add_order(matched_s)
+            unmatched.add_order(replaced)
+            return None
+        elif replaced_quantity < q_order:
+            new_order = order.copy_and_decrease(replaced_quantity)
+            matched.add_order(order)
+            unmatched.add_order(replaced)
+            return new_order
+        return None
 
     def insert(self, order: Order):
         self.agent_id_map[order.agent_id].append(order.order_id)
-        if order.order_type == constants.SELL:
-            if order.price <= self.buy_unmatched.peek() and self.sell_matched.peek() <= self.buy_unmatched.peek():
-                self.handle_new_order(order)
-            elif order.price <= self.sell_matched.peek():
-                self.handle_replace(order)
-            else:
-                self.sell_unmatched.add_order(order)
-        elif order.order_type == constants.BUY:
-            if order.price >= self.sell_unmatched.peek() and self.buy_matched.peek() >= self.sell_unmatched.peek():
-                self.handle_new_order(order)
-            elif order.price >= self.buy_matched.peek():
-                self.handle_replace(order)
-            else:
-                self.buy_unmatched.add_order(order)
+        current_order = order
+        while current_order is not None and current_order.quantity > 0:
+            if current_order.order_type == constants.SELL:
+                if (
+                    current_order.price <= self.buy_unmatched.peek()
+                    and self.sell_matched.peek() <= self.buy_unmatched.peek()
+                ):
+                    current_order = self.handle_new_order(current_order)
+                elif current_order.price <= self.sell_matched.peek():
+                    current_order = self.handle_replace(current_order)
+                else:
+                    self.sell_unmatched.add_order(current_order)
+                    break
+            elif current_order.order_type == constants.BUY:
+                if (
+                    current_order.price >= self.sell_unmatched.peek()
+                    and self.buy_matched.peek() >= self.sell_unmatched.peek()
+                ):
+                    current_order = self.handle_new_order(current_order)
+                elif current_order.price >= self.buy_matched.peek():
+                    current_order = self.handle_replace(current_order)
+                else:
+                    self.buy_unmatched.add_order(current_order)
+                    break
 
     def remove(self, order_id: int):
         if self.buy_unmatched.contains(order_id):

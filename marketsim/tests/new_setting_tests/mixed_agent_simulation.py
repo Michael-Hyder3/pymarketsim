@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 
 from marketsim.fourheap.constants import BUY, SELL
 from marketsim.market.market import Market
@@ -10,6 +11,71 @@ from marketsim.fundamental.lazy_mean_reverting import LazyGaussianMeanReverting
 from marketsim.fundamental.dummy_fundamental import DummyFundamental
 from marketsim.agent.zi_agent_buy_sell import ZIAgentBuy, ZIAgentSell
 from marketsim.agent.hbl_agent_buy_sell import HBLAgentBuy, HBLAgentSell
+from marketsim.agent.bo_agent_buy_sell import BOAgentBuy, BOAgentSell
+
+
+class _RunLevelXOptimizer:
+    def __init__(self, strategy: str = "ucb", x_init: float = 250.0, x_max: float = 3000.0, beta: float = 2.0, seed: int = 0):
+        self.strategy = (strategy or "ucb").lower()
+        self.x_init = max(0.0, float(x_init))
+        self.x_max = max(self.x_init + 1.0, float(x_max))
+        self.beta = float(beta)
+        self.xs: List[float] = []
+        self.rewards: List[float] = []
+        self._rng = np.random.default_rng(seed)
+
+    def _grid(self) -> np.ndarray:
+        if not self.xs:
+            return np.linspace(0.0, self.x_max, 81)
+        x_obs = np.asarray(self.xs, dtype=float)
+        best_x = float(x_obs[int(np.argmax(self.rewards))])
+        spread = float(np.std(x_obs)) if len(x_obs) > 1 else 100.0
+        local_step = max(spread * 0.3, 50.0)
+        local = np.linspace(max(0.0, best_x - 4 * local_step), min(self.x_max, best_x + 4 * local_step), 41)
+        global_grid = np.linspace(0.0, self.x_max, 81)
+        return np.unique(np.concatenate([global_grid, local]))
+
+    def _posterior(self, candidates: np.ndarray):
+        if not self.xs:
+            mean = np.zeros_like(candidates)
+            std = np.ones_like(candidates) * 100.0
+            return mean, std
+
+        x_obs = np.asarray(self.xs, dtype=float)
+        y_obs = np.asarray(self.rewards, dtype=float)
+        length_scale = max(50.0, float(np.std(x_obs)) * 0.5)
+
+        mean = np.zeros_like(candidates)
+        std = np.zeros_like(candidates)
+        for i, x in enumerate(candidates):
+            dist = (x - x_obs) / length_scale
+            w = np.exp(-0.5 * dist ** 2)
+            s = float(np.sum(w))
+            if s <= 1e-12:
+                mean[i] = 0.0
+                std[i] = 100.0
+            else:
+                m = float(np.dot(w, y_obs) / s)
+                var = float(np.dot(w, (y_obs - m) ** 2) / s)
+                mean[i] = m
+                std[i] = float(np.sqrt(max(var, 1e-6)) + 1.0 / np.sqrt(s))
+        return mean, std
+
+    def suggest(self) -> float:
+        if not self.xs:
+            return self.x_init
+        candidates = self._grid()
+        mean, std = self._posterior(candidates)
+        if self.strategy == "thompson":
+            sampled = self._rng.normal(mean, std)
+            return float(candidates[int(np.argmax(sampled))])
+        score = mean + self.beta * std
+        return float(candidates[int(np.argmax(score))])
+
+    def observe(self, x: float, reward: float):
+        x_clip = float(np.clip(x, 0.0, self.x_max))
+        self.xs.append(x_clip)
+        self.rewards.append(float(reward))
 
 
 def _pair_matched_orders(matched_orders):
@@ -81,15 +147,33 @@ def _lob_snapshot(order_book, fundamental_value: float = 0.0) -> dict:
     }
 
 
+def _fundamental_value_at_time(fundamental, time: int, fallback: float) -> float:
+    if fundamental is None:
+        return float(fallback)
+    if hasattr(fundamental, "get_value_at"):
+        return float(fundamental.get_value_at(time))
+    if hasattr(fundamental, "get_value"):
+        try:
+            return float(fundamental.get_value(time))
+        except TypeError:
+            return float(fundamental.get_value())
+    return float(fallback)
+
+
 def run_mixed_agent_test(
     num_zi_buy: int = 50,
     num_zi_sell: int = 50,
     num_hbl_buy: int = 0,
     num_hbl_sell: int = 0,
+    num_bo_buy: int = 0,
+    num_bo_sell: int = 0,
     timesteps: int = 1000,
     q_max: int = 14,
     pv_var: float = 1e5,
     shade_range: List[float] = None,
+    bo_shade_range: List[float] = None,
+    bo_fixed_x: float = None,
+    bo_action_mode: str = "x_cap",
     zi_buy_shade_ranges: List[List[float]] = None,
     zi_buy_shade_counts: List[int] = None,
     zi_sell_shade_ranges: List[List[float]] = None,
@@ -101,15 +185,21 @@ def run_mixed_agent_test(
     shock_var: float = 1e5,
     obs_noise_var: float = 1e6,
     zi_eta: float = 1.0,
+    bo_optimizer_strategy: str = "ucb",
     shade_schedule_mode: str = "time",
     seed: int = None,
+    fixed_buyer_private_values_relative: List[float] = None,
+    fixed_buyer_agent_id: int = None,
 ):
     if shade_range is None:
         shade_range = [0, 500]
+    if bo_shade_range is None:
+        bo_shade_range = [0, 500]
 
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+        torch.manual_seed(seed)
 
     if use_time_varying:
         fundamental = LazyGaussianMeanReverting(
@@ -121,7 +211,7 @@ def run_mixed_agent_test(
     else:
         fundamental = DummyFundamental(value=fundamental_value, final_time=timesteps)
 
-    market = Market(fundamental=fundamental, time_steps=timesteps)
+    market = Market(fundamental=fundamental, time_steps=timesteps, rand_seed=seed)
 
     agents: Dict[str, object] = {}
     id_to_agent: Dict[int, object] = {}
@@ -211,6 +301,63 @@ def run_mixed_agent_test(
         id_to_agent[next_id] = agent
         agent_types[next_id] = "hbl_sell"
         next_id += 1
+
+    for _ in range(num_bo_buy):
+        agent = BOAgentBuy(
+            agent_id=next_id,
+            market=market,
+            q_max=q_max,
+            shade=bo_shade_range,
+            pv_var=pv_var,
+            eta=zi_eta,
+            obs_noise_var=obs_noise_var,
+            optimizer_strategy=bo_optimizer_strategy,
+            fixed_x=bo_fixed_x,
+            action_mode=bo_action_mode,
+        )
+        agents[f"bo_buy_{next_id}"] = agent
+        id_to_agent[next_id] = agent
+        agent_types[next_id] = "bo_buy"
+        agent_shades[next_id] = bo_shade_range
+        next_id += 1
+
+    for _ in range(num_bo_sell):
+        agent = BOAgentSell(
+            agent_id=next_id,
+            market=market,
+            q_max=q_max,
+            shade=bo_shade_range,
+            pv_var=pv_var,
+            eta=zi_eta,
+            obs_noise_var=obs_noise_var,
+            optimizer_strategy=bo_optimizer_strategy,
+            fixed_x=bo_fixed_x,
+            action_mode=bo_action_mode,
+        )
+        agents[f"bo_sell_{next_id}"] = agent
+        id_to_agent[next_id] = agent
+        agent_types[next_id] = "bo_sell"
+        agent_shades[next_id] = bo_shade_range
+        next_id += 1
+
+    if fixed_buyer_private_values_relative is not None and fixed_buyer_agent_id is not None:
+        tracked_agent = id_to_agent.get(fixed_buyer_agent_id)
+        if tracked_agent is None:
+            raise ValueError(f"fixed_buyer_agent_id {fixed_buyer_agent_id} not found")
+        if not hasattr(tracked_agent, "pv") or not hasattr(tracked_agent.pv, "buyer_values"):
+            raise ValueError(f"Agent {fixed_buyer_agent_id} is not a buyer with private values")
+
+        fixed_vals = [float(v) for v in fixed_buyer_private_values_relative]
+        if len(fixed_vals) == 0:
+            raise ValueError("fixed_buyer_private_values_relative must be non-empty")
+        if len(fixed_vals) < q_max:
+            fixed_vals.extend([fixed_vals[-1]] * (q_max - len(fixed_vals)))
+        fixed_vals = fixed_vals[:q_max]
+
+        fixed_tensor = torch.tensor(fixed_vals, dtype=torch.float32)
+        tracked_agent.pv.buyer_values = fixed_tensor
+        tracked_agent.pv.extra_buy = float(fixed_tensor[-1].item())
+
     transactions = []
     agent_surplus = {agent_id: 0.0 for agent_id in id_to_agent}
     order_book_snapshots = []  # kept for backward compat (every-100-step snapshots)
@@ -277,9 +424,9 @@ def run_mixed_agent_test(
             seller_cost = seller.pv.consume_marginal(seller.position, SELL) + fundamental_value
 
             # Transaction-level surplus calculation
-            if agent_types.get(buyer_id, '').startswith('zi_'):
+            if agent_types.get(buyer_id, '').startswith(('zi_', 'bo_')):
                 agent_surplus[buyer_id] += buyer_value - trade_price_shifted
-            if agent_types.get(seller_id, '').startswith('zi_'):
+            if agent_types.get(seller_id, '').startswith(('zi_', 'bo_')):
                 agent_surplus[seller_id] += trade_price_shifted - seller_cost
 
             if hasattr(buyer, "consumed_buy_positions"):
@@ -305,6 +452,7 @@ def run_mixed_agent_test(
             )
 
     zi_agent_ids = [agent_id for agent_id, a_type in agent_types.items() if a_type.startswith("zi_")]
+    bo_agent_ids = [agent_id for agent_id, a_type in agent_types.items() if a_type.startswith("bo_")]
     hbl_agent_ids = [agent_id for agent_id, a_type in agent_types.items() if a_type.startswith("hbl_")]
     hbl_buy_agent_ids = [agent_id for agent_id, a_type in agent_types.items() if a_type == "hbl_buy"]
     hbl_sell_agent_ids = [agent_id for agent_id, a_type in agent_types.items() if a_type == "hbl_sell"]
@@ -330,7 +478,7 @@ def run_mixed_agent_test(
         if eq_price_relative is None and all_seller_costs[i] >= all_buyer_values[i]:
             eq_price_relative = (all_buyer_values[i] + all_seller_costs[i]) / 2.0
 
-    final_fundamental = fundamental.get_value(timesteps) if hasattr(fundamental, "get_value") else fundamental_value
+    final_fundamental = _fundamental_value_at_time(fundamental, timesteps, fundamental_value)
     eq_price = None
     if eq_price_relative is not None:
         eq_price = eq_price_relative + final_fundamental
@@ -354,7 +502,7 @@ def run_mixed_agent_test(
     hbl_rmsd = _rmsd(hbl_prices, fundamental_value)
 
     # For HBL agents, compute mark-to-market surplus at end
-    final_fundamental = fundamental.get_value(timesteps) if hasattr(fundamental, "get_value") else fundamental_value
+    final_fundamental = _fundamental_value_at_time(fundamental, timesteps, fundamental_value)
     for agent_id, agent in id_to_agent.items():
         agent_type = agent_types.get(agent_id, "")
         if agent_type.startswith('hbl_'):
@@ -363,11 +511,13 @@ def run_mixed_agent_test(
             agent_surplus[agent_id] = agent.cash + holdings_value + final_fundamental * agent.position
 
     zi_surpluses = [agent_surplus[agent_id] for agent_id in zi_agent_ids]
+    bo_surpluses = [agent_surplus[agent_id] for agent_id in bo_agent_ids]
     hbl_surpluses = [agent_surplus[agent_id] for agent_id in hbl_agent_ids]
     hbl_buy_surpluses = [agent_surplus[agent_id] for agent_id in hbl_buy_agent_ids]
     hbl_sell_surpluses = [agent_surplus[agent_id] for agent_id in hbl_sell_agent_ids]
     
     zi_avg = float(np.mean(zi_surpluses)) if zi_surpluses else 0.0
+    bo_avg = float(np.mean(bo_surpluses)) if bo_surpluses else 0.0
     hbl_avg = float(np.mean(hbl_surpluses)) if hbl_surpluses else 0.0
     hbl_buy_avg = float(np.mean(hbl_buy_surpluses)) if hbl_buy_surpluses else 0.0
     hbl_sell_avg = float(np.mean(hbl_sell_surpluses)) if hbl_sell_surpluses else 0.0
@@ -399,22 +549,39 @@ def run_mixed_agent_test(
             }
         )
 
+    bo_agent_stats = []
+    for agent_id in bo_agent_ids:
+        bo_agent_stats.append(
+            {
+                "agent_id": agent_id,
+                "agent_type": agent_types.get(agent_id),
+                "shade_range": agent_shades.get(agent_id),
+                "surplus": agent_surplus.get(agent_id, 0.0),
+                "trades": trade_counts.get(agent_id, 0),
+                "buy_trades": buy_trade_counts.get(agent_id, 0),
+                "sell_trades": sell_trade_counts.get(agent_id, 0),
+            }
+        )
+
     results = {
         "transactions": transactions,
         "agent_surplus": agent_surplus,
         "agent_types": agent_types,
         "agent_shades": agent_shades,
         "zi_agent_stats": zi_agent_stats,
+        "bo_agent_stats": bo_agent_stats,
         "agents": agents,
         "fundamental": fundamental,
         "fundamental_value": fundamental_value,
         "timesteps": timesteps,
         "order_book_snapshots": order_book_snapshots,
         "zi_avg_surplus": zi_avg,
+        "bo_avg_surplus": bo_avg,
         "hbl_avg_surplus": hbl_avg,
         "hbl_buy_avg_surplus": hbl_buy_avg,
         "hbl_sell_avg_surplus": hbl_sell_avg,
         "zi_total_surplus": float(np.sum(zi_surpluses)) if zi_surpluses else 0.0,
+        "bo_total_surplus": float(np.sum(bo_surpluses)) if bo_surpluses else 0.0,
         "hbl_total_surplus": float(np.sum(hbl_surpluses)) if hbl_surpluses else 0.0,
         "optimal_surplus": optimal_surplus,
         "eq_price": eq_price,
@@ -431,17 +598,19 @@ def _print_summary(results):
     print("=" * 60)
     print(f"Total transactions: {results['total_transactions']}")
     print(f"ZI total surplus: {results['zi_total_surplus']:.2f}")
+    print(f"BO total surplus: {results['bo_total_surplus']:.2f}")
     print(f"HBL total surplus: {results['hbl_total_surplus']:.2f}")
     print(f"ZI avg surplus per agent: {results['zi_avg_surplus']:.2f}")
+    print(f"BO avg surplus per agent: {results['bo_avg_surplus']:.2f}")
     print(f"HBL avg surplus per agent: {results['hbl_avg_surplus']:.2f}")
     print(f"  HBL Buy avg surplus: {results['hbl_buy_avg_surplus']:.2f}")
     print(f"  HBL Sell avg surplus: {results['hbl_sell_avg_surplus']:.2f}")
     
     # Calculate efficiency metrics
-    combined_total = results['zi_total_surplus'] + results['hbl_total_surplus']
+    combined_total = results['zi_total_surplus'] + results['bo_total_surplus'] + results['hbl_total_surplus']
     efficiency = (combined_total / results['optimal_surplus'] * 100.0) if results['optimal_surplus'] > 0 else 0.0
     print(f"\nEfficiency Metric:")
-    print(f"Combined total surplus (ZI + HBL): {combined_total:.2f}")
+    print(f"Combined total surplus (ZI + BO + HBL): {combined_total:.2f}")
     print(f"Optimal total surplus: {results['optimal_surplus']:.2f}")
     print(f"Efficiency: {efficiency:.2f}%")
 
@@ -449,6 +618,19 @@ def _print_summary(results):
     if zi_agent_stats:
         print("\nZI Agent Stats:")
         for stat in sorted(zi_agent_stats, key=lambda s: s["agent_id"]):
+            shade = stat.get("shade_range")
+            shade_str = f"{shade}" if shade is not None else "None"
+            print(
+                "  "
+                f"id={stat['agent_id']} type={stat['agent_type']} shade={shade_str} "
+                f"surplus={stat['surplus']:.2f} trades={stat['trades']} "
+                f"buy={stat['buy_trades']} sell={stat['sell_trades']}"
+            )
+
+    bo_agent_stats = results.get("bo_agent_stats", [])
+    if bo_agent_stats:
+        print("\nBO Agent Stats:")
+        for stat in sorted(bo_agent_stats, key=lambda s: s["agent_id"]):
             shade = stat.get("shade_range")
             shade_str = f"{shade}" if shade is not None else "None"
             print(
@@ -503,8 +685,8 @@ def _compute_equilibrium_price(results):
     fundamental = results.get("fundamental")
     timesteps = results.get("timesteps")
     base_fundamental = results.get("fundamental_value")
-    if fundamental is not None and timesteps is not None and hasattr(fundamental, "get_value"):
-        return eq_price + fundamental.get_value(timesteps)
+    if fundamental is not None and timesteps is not None:
+        return eq_price + _fundamental_value_at_time(fundamental, timesteps, base_fundamental or 0.0)
     if base_fundamental is not None:
         return eq_price + base_fundamental
     return eq_price
@@ -552,35 +734,64 @@ def _plot_transactions(results):
     plt.show()
 
 
-def run_mixed_agent_batch(num_iterations: int = 25, **kwargs):
+def run_mixed_agent_batch(
+    num_iterations: int = 25,
+    bo_optimize_across_runs: bool = False,
+    bo_run_optimizer_strategy: str = "ucb",
+    bo_run_x_init: float = 250.0,
+    bo_run_x_max: float = 3000.0,
+    bo_run_beta: float = 2.0,
+    increment_seed_per_iteration: bool = True,
+    **kwargs,
+):
     """Run mixed-agent test multiple times and print a summary at the end."""
     summaries = {
         "total_transactions": [],
         "zi_total_surplus": [],
+        "bo_total_surplus": [],
         "hbl_total_surplus": [],
         "hbl_buy_avg_surplus": [],
         "hbl_sell_avg_surplus": [],
         "zi_avg_surplus": [],
+        "bo_avg_surplus": [],
         "hbl_avg_surplus": [],
         "optimal_surplus": [],
         "zi_rmsd": [],
         "hbl_rmsd": [],
         "eq_price": [],
+        "bo_run_optimizer_trace": [],
     }
 
     zi_agent_aggregates = {}
 
     base_seed = kwargs.get("seed")
+    run_optimizer = None
+    if bo_optimize_across_runs and (kwargs.get("num_bo_buy", 0) > 0 or kwargs.get("num_bo_sell", 0) > 0):
+        run_optimizer = _RunLevelXOptimizer(
+            strategy=bo_run_optimizer_strategy,
+            x_init=bo_run_x_init,
+            x_max=bo_run_x_max,
+            beta=bo_run_beta,
+            seed=base_seed or 0,
+        )
+
     for i in range(num_iterations):
-        if base_seed is not None:
+        if base_seed is not None and increment_seed_per_iteration:
             kwargs["seed"] = base_seed + i
+        elif base_seed is not None:
+            kwargs["seed"] = base_seed
+        if run_optimizer is not None:
+            x_for_run = run_optimizer.suggest()
+            kwargs["bo_fixed_x"] = x_for_run
         results = run_mixed_agent_test(**kwargs)
         summaries["total_transactions"].append(results["total_transactions"])
         summaries["zi_total_surplus"].append(results["zi_total_surplus"])
+        summaries["bo_total_surplus"].append(results["bo_total_surplus"])
         summaries["hbl_total_surplus"].append(results["hbl_total_surplus"])
         summaries["hbl_buy_avg_surplus"].append(results["hbl_buy_avg_surplus"])
         summaries["hbl_sell_avg_surplus"].append(results["hbl_sell_avg_surplus"])
         summaries["zi_avg_surplus"].append(results["zi_avg_surplus"])
+        summaries["bo_avg_surplus"].append(results["bo_avg_surplus"])
         summaries["hbl_avg_surplus"].append(results["hbl_avg_surplus"])
         summaries["optimal_surplus"].append(results["optimal_surplus"])
         summaries["zi_rmsd"].append(results["zi_rmsd"])
@@ -588,6 +799,17 @@ def run_mixed_agent_batch(num_iterations: int = 25, **kwargs):
         eq_price = results.get("eq_price")
         if eq_price is not None:
             summaries["eq_price"].append(eq_price)
+
+        if run_optimizer is not None:
+            reward_for_run = results.get("bo_avg_surplus", 0.0)
+            run_optimizer.observe(kwargs.get("bo_fixed_x", 0.0), reward_for_run)
+            summaries["bo_run_optimizer_trace"].append(
+                {
+                    "run": i + 1,
+                    "x": float(kwargs.get("bo_fixed_x", 0.0)),
+                    "reward": float(reward_for_run),
+                }
+            )
 
         for stat in results.get("zi_agent_stats", []):
             agent_id = stat["agent_id"]
@@ -615,8 +837,10 @@ def run_mixed_agent_batch(num_iterations: int = 25, **kwargs):
     print(f"Runs: {num_iterations}")
     print(f"Avg transactions: {np.mean(summaries['total_transactions']):.2f}")
     print(f"Avg ZI total surplus: {np.mean(summaries['zi_total_surplus']):.2f}")
+    print(f"Avg BO total surplus: {np.mean(summaries['bo_total_surplus']):.2f}")
     print(f"Avg HBL total surplus: {np.mean(summaries['hbl_total_surplus']):.2f}")
     print(f"Avg ZI avg surplus: {np.mean(summaries['zi_avg_surplus']):.2f}")
+    print(f"Avg BO avg surplus: {np.mean(summaries['bo_avg_surplus']):.2f}")
     print(f"Avg HBL avg surplus: {np.mean(summaries['hbl_avg_surplus']):.2f}")
     print(f"Avg max total surplus (optimal): {np.mean(summaries['optimal_surplus']):.2f}")
     print(f"Avg ZI RMSD: {np.mean(summaries['zi_rmsd']):.2f}")
@@ -625,11 +849,15 @@ def run_mixed_agent_batch(num_iterations: int = 25, **kwargs):
         print(f"Avg equilibrium price: {np.mean(summaries['eq_price']):.2f}")
     
     # Calculate average efficiency metric
-    avg_combined_total = np.mean(summaries['zi_total_surplus']) + np.mean(summaries['hbl_total_surplus'])
+    avg_combined_total = (
+        np.mean(summaries['zi_total_surplus'])
+        + np.mean(summaries['bo_total_surplus'])
+        + np.mean(summaries['hbl_total_surplus'])
+    )
     avg_optimal = np.mean(summaries['optimal_surplus'])
     avg_efficiency = (avg_combined_total / avg_optimal * 100.0) if avg_optimal > 0 else 0.0
     print(f"\nAverage Efficiency Metric:")
-    print(f"Avg combined total surplus (ZI + HBL): {avg_combined_total:.2f}")
+    print(f"Avg combined total surplus (ZI + BO + HBL): {avg_combined_total:.2f}")
     print(f"Avg optimal total surplus: {avg_optimal:.2f}")
     print(f"Average Efficiency: {avg_efficiency:.2f}%")
 
@@ -661,6 +889,35 @@ def run_mixed_agent_batch(num_iterations: int = 25, **kwargs):
     ]
 
     return summaries
+
+
+def run_bo_across_runs_experiment(
+    num_runs: int = 50,
+    optimizer_strategy: str = "thompson",
+    x_init: float = 381.25,
+    x_max: float = 2500.0,
+    seed: int = 42,
+    keep_context_fixed: bool = True,
+):
+    """Convenience wrapper: optimize BO shading-cap x across full simulation runs."""
+    return run_mixed_agent_batch(
+        num_iterations=num_runs,
+        bo_optimize_across_runs=True,
+        bo_run_optimizer_strategy=optimizer_strategy,
+        bo_run_x_init=x_init,
+        bo_run_x_max=x_max,
+        increment_seed_per_iteration=not keep_context_fixed,
+        num_zi_buy=5,
+        num_zi_sell=6,
+        num_hbl_buy=0,
+        num_hbl_sell=0,
+        num_bo_buy=1,
+        num_bo_sell=0,
+        timesteps=300,
+        arrival_rate=0.1,
+        use_time_varying=False,
+        seed=seed,
+    )
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ class DummyFundamental:
         self.mean = float(value)
         self.r = float(r)
 
-    def get_value(self):
+    def get_value(self, time=None):
         return self.value
 
     def get_value_at(self, time):
