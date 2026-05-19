@@ -1,0 +1,586 @@
+{
+  "agent_type": "buyer",
+  "agent_private_values_relative": [
+    329.4169006347656,
+    180.14881896972656,
+    156.0333251953125,
+    99.7743148803711,
+    -71.93934631347656,
+    -74.55413818359375,
+    -87.45462799072266,
+    -95.8044204711914,
+    -155.89796447753906,
+    -567.3712158203125
+  ],
+  "timesteps": 400,
+  "events": [
+    {
+      "time": 3,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 131.9339,
+      "lob": {
+        "best_bid_relative": -277.54,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -277.54
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 4,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -331.1105,
+      "lob": {
+        "best_bid_relative": -480.18,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -480.18
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 5,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.065
+      },
+      "lob": {
+        "best_bid_relative": -480.18,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -480.18
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 6,
+      "event_type": "trade",
+      "agent_transacted": true,
+      "agent_bid": true,
+      "trade_price_relative": 314.7205,
+      "agent_action": {
+        "shade": 0.065,
+        "surplus_earned": 14.6964
+      },
+      "lob": {
+        "best_bid_relative": -480.18,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -480.18
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 12,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 178.8732,
+      "lob": {
+        "best_bid_relative": -184.73,
+        "best_ask_relative": 93.31,
+        "bids_relative": [
+          -184.73,
+          -480.18
+        ],
+        "asks_relative": [
+          93.31
+        ]
+      }
+    },
+    {
+      "time": 17,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.6065
+      },
+      "lob": {
+        "best_bid_relative": -568.15,
+        "best_ask_relative": 161.63,
+        "bids_relative": [
+          -568.15
+        ],
+        "asks_relative": [
+          161.63,
+          878.54,
+          1097.62
+        ]
+      }
+    },
+    {
+      "time": 20,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -33.3636,
+      "lob": {
+        "best_bid_relative": -95.91,
+        "best_ask_relative": 161.63,
+        "bids_relative": [
+          -95.91
+        ],
+        "asks_relative": [
+          161.63,
+          878.54,
+          1097.62
+        ]
+      }
+    },
+    {
+      "time": 24,
+      "event_type": "trade",
+      "agent_transacted": true,
+      "agent_bid": true,
+      "trade_price_relative": 164.897,
+      "agent_action": {
+        "shade": 0.6065,
+        "surplus_earned": 15.2518
+      },
+      "lob": {
+        "best_bid_relative": -650.69,
+        "best_ask_relative": -117.42,
+        "bids_relative": [
+          -650.69,
+          -1612.6
+        ],
+        "asks_relative": [
+          -117.42,
+          905.53
+        ]
+      }
+    },
+    {
+      "time": 26,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -117.4193,
+      "lob": {
+        "best_bid_relative": -1612.6,
+        "best_ask_relative": -117.42,
+        "bids_relative": [
+          -1612.6
+        ],
+        "asks_relative": [
+          -117.42,
+          398.66,
+          905.53
+        ]
+      }
+    },
+    {
+      "time": 29,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 398.6605,
+      "lob": {
+        "best_bid_relative": 37.95,
+        "best_ask_relative": 704.25,
+        "bids_relative": [
+          37.95,
+          -1612.6
+        ],
+        "asks_relative": [
+          704.25,
+          905.53
+        ]
+      }
+    },
+    {
+      "time": 32,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.2501
+      },
+      "lob": {
+        "best_bid_relative": -1541.42,
+        "best_ask_relative": 1629.27,
+        "bids_relative": [
+          -1541.42,
+          -1670.91
+        ],
+        "asks_relative": [
+          1629.27
+        ]
+      }
+    },
+    {
+      "time": 34,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.8929
+      },
+      "lob": {
+        "best_bid_relative": -1749.18,
+        "best_ask_relative": 1629.27,
+        "bids_relative": [
+          -1749.18
+        ],
+        "asks_relative": [
+          1629.27
+        ]
+      }
+    },
+    {
+      "time": 52,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -182.1198,
+      "lob": {
+        "best_bid_relative": null,
+        "best_ask_relative": -182.12,
+        "bids_relative": [],
+        "asks_relative": [
+          -182.12,
+          1443.03
+        ]
+      }
+    },
+    {
+      "time": 55,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -121.3018,
+      "lob": {
+        "best_bid_relative": null,
+        "best_ask_relative": -121.3,
+        "bids_relative": [],
+        "asks_relative": [
+          -121.3
+        ]
+      }
+    },
+    {
+      "time": 56,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -121.3018,
+      "lob": {
+        "best_bid_relative": null,
+        "best_ask_relative": null,
+        "bids_relative": [],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 60,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -51.2069,
+      "lob": {
+        "best_bid_relative": -51.21,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -51.21,
+          -260.34
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 65,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.4394
+      },
+      "lob": {
+        "best_bid_relative": -51.21,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -51.21,
+          -260.34
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 70,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.2592
+      },
+      "lob": {
+        "best_bid_relative": 237.18,
+        "best_ask_relative": null,
+        "bids_relative": [
+          237.18,
+          -835.04
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 72,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 237.1759,
+      "lob": {
+        "best_bid_relative": -304.78,
+        "best_ask_relative": null,
+        "bids_relative": [
+          -304.78,
+          -362.13,
+          -835.04
+        ],
+        "asks_relative": []
+      }
+    },
+    {
+      "time": 87,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -91.1849,
+      "lob": {
+        "best_bid_relative": -91.18,
+        "best_ask_relative": 467.46,
+        "bids_relative": [
+          -91.18,
+          -158.47
+        ],
+        "asks_relative": [
+          467.46,
+          699.37,
+          1090.41
+        ]
+      }
+    },
+    {
+      "time": 95,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.9272
+      },
+      "lob": {
+        "best_bid_relative": -91.18,
+        "best_ask_relative": 422.63,
+        "bids_relative": [
+          -91.18,
+          -1014.46
+        ],
+        "asks_relative": [
+          422.63,
+          467.46,
+          623.76,
+          836.49
+        ]
+      }
+    },
+    {
+      "time": 96,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.2947
+      },
+      "lob": {
+        "best_bid_relative": -91.18,
+        "best_ask_relative": 422.63,
+        "bids_relative": [
+          -91.18,
+          -1014.46
+        ],
+        "asks_relative": [
+          422.63,
+          467.46,
+          623.76,
+          836.49
+        ]
+      }
+    },
+    {
+      "time": 113,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.4583
+      },
+      "lob": {
+        "best_bid_relative": -764.24,
+        "best_ask_relative": 254.49,
+        "bids_relative": [
+          -764.24,
+          -1235.83
+        ],
+        "asks_relative": [
+          254.49,
+          492.27,
+          1025.15,
+          1085.32
+        ]
+      }
+    },
+    {
+      "time": 119,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -101.6151,
+      "lob": {
+        "best_bid_relative": -167.18,
+        "best_ask_relative": -101.62,
+        "bids_relative": [
+          -167.18,
+          -1235.83
+        ],
+        "asks_relative": [
+          -101.62,
+          492.27,
+          671.23
+        ]
+      }
+    },
+    {
+      "time": 120,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": -101.6151,
+      "lob": {
+        "best_bid_relative": -167.18,
+        "best_ask_relative": -101.62,
+        "bids_relative": [
+          -167.18,
+          -1235.83
+        ],
+        "asks_relative": [
+          -101.62,
+          671.23
+        ]
+      }
+    },
+    {
+      "time": 129,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.7206
+      },
+      "lob": {
+        "best_bid_relative": -501.86,
+        "best_ask_relative": 270.45,
+        "bids_relative": [
+          -501.86,
+          -508.58,
+          -1036.2
+        ],
+        "asks_relative": [
+          270.45,
+          393.22,
+          580.48,
+          656.63
+        ]
+      }
+    },
+    {
+      "time": 136,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.6694
+      },
+      "lob": {
+        "best_bid_relative": 111.53,
+        "best_ask_relative": 207.52,
+        "bids_relative": [
+          111.53,
+          -482.07
+        ],
+        "asks_relative": [
+          207.52
+        ]
+      }
+    },
+    {
+      "time": 138,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 111.5301,
+      "lob": {
+        "best_bid_relative": -72.39,
+        "best_ask_relative": 207.52,
+        "bids_relative": [
+          -72.39,
+          -482.07
+        ],
+        "asks_relative": [
+          207.52
+        ]
+      }
+    },
+    {
+      "time": 143,
+      "event_type": "trade",
+      "agent_transacted": false,
+      "agent_bid": false,
+      "trade_price_relative": 61.7687,
+      "lob": {
+        "best_bid_relative": -334.25,
+        "best_ask_relative": 73.02,
+        "bids_relative": [
+          -334.25,
+          -633.19
+        ],
+        "asks_relative": [
+          73.02,
+          114.83
+        ]
+      }
+    },
+    {
+      "time": 143,
+      "event_type": "agent_order",
+      "agent_transacted": false,
+      "agent_bid": true,
+      "agent_action": {
+        "shade": 0.9717
+      },
+      "lob": {
+        "best_bid_relative": 61.77,
+        "best_ask_relative": 73.02,
+        "bids_relative": [
+          61.77,
+          -182.42,
+          -334.25
+        ],
+        "asks_relative": [
+          73.02,
+          114.83
+        ]
+      }
+    }
+  ]
+}

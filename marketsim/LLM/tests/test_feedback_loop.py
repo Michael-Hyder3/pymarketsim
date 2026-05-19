@@ -74,7 +74,7 @@ def main(args):
 
     baseline = MarketConfig(
         num_zi_buy=5, num_zi_sell=5, timesteps=1000,
-        q_max=10, pv_var=1e5, shade_range=[0, 500], label="baseline",
+        q_max=10, pv_var=1e5, shade_range=[0.0, 1.0], label="baseline",
         fixed_private_values_relative=private_values,
         fixed_seed=args.seed,
     )
