@@ -28,15 +28,26 @@ wheels/
 *.egg
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
 
-# IDE
+# IDE / local
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
+.DS_Store
+.ipynb_checkpoints/
 
 # Weights & Biases
 wandb/
+
+# Experiment outputs (keep on disk, do not track)
+results/
+llm_calls/
+llm_calls_*/
+llm_generalization_*/
+marketsim/LLM/reflection_pipeline/runs/
