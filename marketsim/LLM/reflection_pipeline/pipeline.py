@@ -1,30 +1,138 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import random
+import re
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from openai import OpenAI
 
 from marketsim.LLM.code_generator import CodeGenerator
 from marketsim.LLM.code_storage import CodeStorage
-from marketsim.LLM.reflection_pipeline.config import ReflectionMarketConfig, build_default_config_pool
-from marketsim.LLM.reflection_pipeline.evaluation import evaluate_batch
-from marketsim.LLM.reflection_pipeline.offline_example import generate_offline_example, load_offline_example
+from marketsim.LLM.lob_features import (
+    DEFAULT_LOB_INPUT_MODE,
+    is_lob_book_orders_mode,
+    is_lob_features_mode,
+    is_lob_hbl_parity_mode,
+    normalize_lob_input_mode,
+)
+from marketsim.LLM.spread_input import (
+    DEFAULT_SPREAD_INPUT_MODE,
+    is_spread_book_mode,
+    is_spread_zip_parity_mode,
+    normalize_spread_input_mode,
+    set_spread_omit_fundamental,
+    spread_feature_names_for_prompts,
+)
+from marketsim.LLM.background_agents import (
+    DEFAULT_BACKGROUND_AGENT_KIND,
+    normalize_background_agent_kind,
+)
+from marketsim.LLM.reflection_pipeline.benchmark_suite import FixedEvalSuite, build_fixed_eval_suite
+from marketsim.LLM.reflection_pipeline.config import (
+    ReflectionMarketConfig,
+    ReflectionConfigSpace,
+    build_default_config_pool,
+    build_default_config_space,
+    resample_market_shade_ranges,
+    sample_stratified_home_set,
+    DEFAULT_PARENT_SELECTION_MODE,
+    DEFAULT_Q_EVAL_MODE,
+    DEFAULT_Q_REWARD_MODE,
+    DEFAULT_Q_UPDATE_MODE,
+    DEFAULT_CRITIC_MODE,
+    CRITIC_MODES,
+    FULL_REFRESH_PARALLEL_WORKERS,
+    Q_REFRESH_ALWAYS_RECENT,
+    Q_REFRESH_EPISODE_WORKERS,
+    Q_REFRESH_TOP_K,
+    INACTIVE_BEAT_GAP,
+    INACTIVE_GATE_MIN_NODES,
+    INACTIVE_SURPLUS_GAP,
+    PARENT_SELECTION_MODES,
+    ZI_BENCHMARK_PARALLEL_WORKERS,
+    ZI_Q_REWARD_MODES,
+)
+from marketsim.LLM.reflection_pipeline.evaluation import (
+    build_case_card_payload,
+    evaluate_batch,
+)
+from marketsim.LLM.reflection_pipeline.metrics import (
+    build_critic_batch_summary,
+    summarize_batch_performance,
+    summarize_per_config_performance,
+)
+from marketsim.LLM.reflection_pipeline.parallel_eval import refresh_nodes_parallel
+from marketsim.LLM.reflection_pipeline.zi_benchmark_eval import evaluate_batch_with_zi_benchmarks
 from marketsim.LLM.reflection_pipeline.prompts import (
     build_generation_prompt,
     build_debug_prompt,
     build_reflection_prompt,
+    build_plateau_revision_prompt,
+    collect_hypothesis_pairs_from_reflections,
+    compute_menu_coverage_stats,
+    derive_family_id,
+    hypothesis_jump_generator_instructions,
+    infer_curriculum_shade_diagnosis,
+    is_structured_principle_form,
+    menu_hypothesis_pairs,
+    diagnosis_action_generator_instructions,
+    parse_diagnosis_action,
+    parse_principle_form_fields,
+    parse_same_failure_as_last_hold,
+    plateau_escape_generator_instructions,
+    set_principle_menu_preset,
+    validate_structured_principle_form_reflection,
+)
+from marketsim.LLM.reflection_pipeline.diagnosis_agreement import (
+    validate_code_implements_diagnosis,
+)
+from marketsim.LLM.reflection_pipeline.hypothesis_quality import (
+    score_hypothesis_adherence,
+)
+from marketsim.LLM.reflection_pipeline.learning_focused import (
+    DEFAULT_LOB_SEED_SCALE,
+    LessonMemory,
+    enrich_verify_error_hint,
+    normalize_lob_seed_scale,
 )
 from marketsim.LLM.reflection_pipeline.tree import RefinementTree
 from marketsim.LLM.feedback_loop import DEFAULT_MARKET_DESCRIPTION
+from marketsim.LLM.reflection_pipeline.code_edit import finalize_strategy_code
 from marketsim.LLM.reflection_pipeline.verification import StrategyVerifier
 
 DEFAULT_STRATEGY_CODE = ""
+
+
+def select_q_refresh_node_ids(
+    candidate_ids: List[int],
+    *,
+    q_by_id: Dict[int, float],
+    top_k: int = Q_REFRESH_TOP_K,
+    always_recent: int = Q_REFRESH_ALWAYS_RECENT,
+) -> List[int]:
+    if not candidate_ids:
+        return []
+    if top_k <= 0 or len(candidate_ids) <= top_k:
+        return sorted(candidate_ids)
+
+    ordered = sorted(int(n) for n in candidate_ids)
+    recent_n = max(0, min(int(always_recent), len(ordered), int(top_k)))
+    recent = ordered[-recent_n:] if recent_n else []
+    recent_set = set(recent)
+    remaining = [n for n in ordered if n not in recent_set]
+    remaining.sort(
+        key=lambda nid: (float(q_by_id.get(nid, float("-inf"))), nid),
+        reverse=True,
+    )
+    slots = max(0, int(top_k) - len(recent))
+    return recent + remaining[:slots]
 
 
 @dataclass
@@ -35,6 +143,840 @@ class GenerationResult:
     success: bool
     error: Optional[str]
     code_file: Optional[str]
+    strategy_type: str
+    node_id: Optional[int] = None
+    escape_mode: bool = False
+    hypothesis_jump: bool = False
+    combination_mode: bool = False
+    parent_select_mode: Optional[str] = None
+    combination_source_codes: Optional[List[str]] = None
+    combination_source_family_ids: Optional[List[str]] = None
+
+
+CRITIC_CONTEXT_LIMIT = 8192
+CRITIC_MAX_OUTPUT_TOKENS = 2048
+CRITIC_PROMPT_SAFETY_TOKENS = 96
+CRITIC_CHARS_PER_TOKEN = 3
+CRITIC_MAX_PROMPT_CHARS = (
+    CRITIC_CONTEXT_LIMIT - CRITIC_MAX_OUTPUT_TOKENS - CRITIC_PROMPT_SAFETY_TOKENS
+) * CRITIC_CHARS_PER_TOKEN
+CRITIC_INTERACTION_LIMITS = (16, 12, 8, 5)
+GENERATOR_INTERACTION_LIMIT = 12
+CRITIC_SYSTEM_PROMPT = (
+    "Return a concise 5-part reflection for advantage-mode batch evaluation. "
+    "Use headings Environment, Performance, Mechanism, Principle, Fix. "
+    "Reference FAILED per-config unit tests by test_id. "
+    "Mechanism must cite at least two trajectory moments. Fix must implement Principle."
+)
+CRITIC_SYSTEM_PROMPT_ZI = (
+    "Return a concise 5-part reflection for ZI beat-fraction evaluation. "
+    "Use headings Environment, Performance, Mechanism, Principle, Fix. "
+    "Reference FAILED ZI benchmark unit tests by test_id. "
+    "Mechanism must cite at least two trajectory moments. "
+    "Fix describes a revision direction; do not paste full replacement code."
+)
+CRITIC_SYSTEM_PROMPT_ZI_ADVANTAGE = (
+    "Return a concise 5-part reflection for ZI benchmark evaluation with advantage Q reward. "
+    "Use headings Environment, Performance, Mechanism, Principle, Fix. "
+    "Reference FAILED ZI benchmark unit tests by test_id. "
+    "Mechanism must cite at least two trajectory moments. "
+    "Fix describes a revision direction; do not paste full replacement code."
+)
+CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM = (
+    "Return a field-first DIAGNOSIS for a PV-only shading strategy. "
+    "Start with the DIAGNOSIS block (principle, form_class, shade_error_direction, "
+    "features_used, parent_form, why_parent_fails, diversity_vs_parent). Then "
+    "MECHANISM and FIX only (no Environment/Performance/Principle essay sections). "
+    "State a shade-level hypothesis (shade_more / shade_less / reshape_pv_map) and "
+    "realize it via menu parameters (principle + form_class). Never hardcode shade "
+    "floats or test_ids. Higher x_cap = more shade (less aggressive). PV-only: "
+    "private_values (Θ), fundamental_estimate (F̃), and current_pv (unit being priced) "
+    "are available — prefer principles that can use them when useful; ban "
+    "LOB/bid-ask/trend stories."
+)
+CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_LOB = (
+    "Return a field-first DIAGNOSIS for LOB-only principle/form refinement. "
+    "Start with the DIAGNOSIS block (principle, form_class, shade_error_direction, "
+    "features_used, parent_form, why_parent_fails, diversity_vs_parent). Then "
+    "MECHANISM and FIX only (no Environment/Performance/Principle essay sections). "
+    "Pick principle and form_class from the allowed LOB order-memory menus "
+    "(fill_vs_reject / side_pressure / order_flow_imbalance / recent_aggressiveness / "
+    "current_pv_vs_flow). Prefer market_history['orders'] (accepted/side/price_rel/L) "
+    "over snapshot depth alone. State shade_error_direction as a level hypothesis "
+    "realized by that menu pair. Never hardcode shade floats or test_ids. "
+    "Higher x_cap = more shade (less aggressive). LOB-only: use market_history fields; "
+    "do not invent a full private_values schedule."
+)
+CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_LOB_BOOK_ORDERS = (
+    "Return a field-first DIAGNOSIS for LOB-only principle/form refinement. "
+    "Start with the DIAGNOSIS block (principle, form_class, shade_error_direction, "
+    "features_used, parent_form, why_parent_fails, diversity_vs_parent). Then "
+    "MECHANISM and FIX only (no Environment/Performance/Principle essay sections). "
+    "Pick principle and form_class from the allowed LOB book_orders menus "
+    "(fill_vs_reject / order_flow_imbalance / recent_aggressiveness / book_imbalance / "
+    "depth_asymmetry). Use live bids/asks/best_bid/best_ask plus the L-window orders "
+    "tape; bids/asks = resting book, orders = historical tape. State "
+    "shade_error_direction as a level hypothesis realized by that menu pair. Never "
+    "hardcode shade floats or test_ids. Higher x_cap = more shade (less aggressive). "
+    "LOB-only: use market_history fields; do not invent a full private_values schedule."
+)
+CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_SPREAD = (
+    "Return a field-first DIAGNOSIS for a spread-only shading strategy. "
+    "Start with DIAGNOSIS (principle, form_class, shade_error_direction, features_used, "
+    "current_form, why_this_fails, action, proposed_change), then MECHANISM and FIX only. "
+    "State a shade-level hypothesis and realize it via the allowed spread menu pair. "
+    "Never hardcode shade floats. Use market_state fields (quotes, inventory, "
+    "current_pv, private_values, and when present shouts or own prev_event); "
+    "private_values is the remaining-unit schedule (same as PV). Do not invent LOB depth."
+)
+CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_SPREAD_BOOK = (
+    "Return a field-first DIAGNOSIS for a spread-book shading strategy. "
+    "Start with DIAGNOSIS (principle, form_class, shade_error_direction, features_used, "
+    "current_form, why_this_fails, action, proposed_change), then MECHANISM and FIX only. "
+    "State a shade-level hypothesis and realize it via the Sp-book hybrid-B menu pair "
+    "(mid_vs_rhat / pv_vs_touch / inventory_remaining_fraction / "
+    "own_prev_feedback / quote_liquidity). Never hardcode shade floats. Use "
+    "market_state fields (quotes, resting depth, inventory, current_pv, "
+    "private_values, prev_event, and fundamental_estimate when present). "
+    "Relative quotes are ~0-scale — do not threshold them like fractions. "
+    "Signature agent_strategy(market_state). NO shouts / full tape / L-window orders."
+)
+
+
+def _structured_principle_form_system_prompt(
+    *,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    spread_omit_fundamental: bool = False,
+) -> str:
+    if strategy_type == "lob":
+        if is_lob_book_orders_mode(lob_input_mode):
+            return CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_LOB_BOOK_ORDERS
+        return CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_LOB
+    if strategy_type == "spread":
+        if is_spread_book_mode(spread_input_mode):
+            feats = spread_feature_names_for_prompts(
+                spread_input_mode, omit_fundamental=spread_omit_fundamental
+            )
+            omit_note = (
+                " F̂ is omitted this run — do not cite fundamental_estimate."
+                if spread_omit_fundamental
+                else ""
+            )
+            return (
+                f"{CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_SPREAD_BOOK} "
+                f"market_state fields: {feats}.{omit_note}"
+            )
+        return CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_SPREAD
+    return CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM
+
+
+def _forced_menu_pair_diagnosis(
+    *,
+    principle: str,
+    form_class: str,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    shade_error_direction: str = "reshape_pv_map",
+) -> str:
+    direction = str(shade_error_direction or "reshape_pv_map").strip()
+    if direction not in ("shade_more", "shade_less", "reshape_pv_map"):
+        direction = "reshape_pv_map"
+    if strategy_type == "lob" and is_lob_features_mode(lob_input_mode):
+        features = "imbalance, spread_rel, log_pv"
+    elif strategy_type == "lob" and is_lob_book_orders_mode(lob_input_mode):
+        features = "bids, asks, orders, best_bid, best_ask, current_pv"
+    elif strategy_type == "lob":
+        features = "orders, best_bid, best_ask, current_pv"
+    elif strategy_type == "spread":
+        if is_spread_book_mode(spread_input_mode):
+            if principle == "bid_ask_spread_width":
+                features = "best_bid, best_ask, current_pv"
+            elif principle == "inventory_remaining_fraction":
+                features = "units_available, q_max, current_pv"
+            elif principle == "book_imbalance":
+                features = "bids, asks, best_bid, best_ask"
+            elif principle == "pv_vs_touch":
+                features = "current_pv, best_bid, best_ask"
+            elif principle == "last_own_accept_reject":
+                features = "prev_event, accepted, best_bid, best_ask, current_pv"
+            else:
+                features = (
+                    "best_bid, best_ask, bids, asks, units_available, "
+                    "current_pv, prev_event"
+                )
+        elif principle in ("recent_accept_reject", "shout_competitiveness"):
+            features = "shouts, best_bid, best_ask, current_pv"
+        elif principle == "last_own_accept_reject":
+            features = "prev_event, accepted, bids, asks, current_pv"
+        else:
+            features = "best_bid, best_ask, units_available, current_pv, shouts"
+    else:
+        features = "pv_mean, pv_max, units_available"
+    return (
+        "DIAGNOSIS:\n"
+        f"  principle: {principle}\n"
+        f"  form_class: {form_class}\n"
+        f"  shade_error_direction: {direction}\n"
+        f"  features_used: {features}\n"
+        "  parent_form: menu-sweep forced pair\n"
+        "  why_parent_fails: systematic menu coverage on this market\n"
+        f"  diversity_vs_parent: force principle={principle} form_class={form_class} "
+        f"realizing {direction}\n"
+        "MECHANISM: Menu-sweep warmup assigns this (principle, form_class) pair; "
+        f"level hypothesis is {direction}.\n"
+        f"FIX: Hypothesis {direction} under principle={principle} + "
+        f"form_class={form_class}.\n"
+    )
+
+
+
+
+
+
+
+
+def _sample_fallback_menu_pair(
+    *,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    rng: Optional[random.Random] = None,
+) -> Tuple[str, str]:
+    pairs = sorted(
+        menu_hypothesis_pairs(
+            strategy_type,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+        )
+    )
+    if not pairs:
+        return ("unknown", "unknown")
+    chooser = rng if rng is not None else random.Random()
+    return chooser.choice(pairs)
+
+
+def _fallback_principle_form_diagnosis(
+    *,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    rng: Optional[random.Random] = None,
+) -> str:
+    principle, form_class = _sample_fallback_menu_pair(
+        strategy_type=strategy_type,
+        lob_input_mode=lob_input_mode,
+        spread_input_mode=spread_input_mode,
+        rng=rng,
+    )
+    return (
+        "DIAGNOSIS:\n"
+        f"  principle: {principle}\n"
+        f"  form_class: {form_class}\n"
+        "  shade_error_direction: reshape_pv_map\n"
+        "  features_used: unknown\n"
+        "  parent_form: unknown\n"
+        "  why_parent_fails: unknown\n"
+        "  diversity_vs_parent: change form vs parent\n"
+        "MECHANISM: Critic-failure fallback; menu pair sampled uniformly from the "
+        "allowed principle×form menu.\n"
+        "FIX: Implement the sampled menu pair.\n"
+    )
+
+
+def _fallback_plateau_diagnosis(
+    *,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    rng: Optional[random.Random] = None,
+) -> str:
+    principle, form_class = _sample_fallback_menu_pair(
+        strategy_type=strategy_type,
+        lob_input_mode=lob_input_mode,
+        spread_input_mode=spread_input_mode,
+        rng=rng,
+    )
+    return (
+        "DIAGNOSIS:\n"
+        f"  principle: {principle}\n"
+        f"  form_class: {form_class}\n"
+        "  shade_error_direction: reshape_pv_map\n"
+        "  features_used: unknown\n"
+        "  parent_form: stalled parent form\n"
+        "  why_parent_fails: local edits did not improve surplus\n"
+        "  diversity_vs_parent: switch form_class vs stalled parent\n"
+        "MECHANISM: Plateau escape fallback after critic failure; menu pair "
+        "sampled uniformly from the allowed principle×form menu.\n"
+        "FIX: Implement a different form_class than the stalled parent.\n"
+    )
+
+
+def _normalize_strategy_code(code: str) -> str:
+    stripped = code.strip()
+    if not stripped:
+        return ""
+    try:
+        tree = ast.parse(stripped)
+        return ast.dump(tree, annotate_fields=False)
+    except SyntaxError:
+        return "".join(stripped.split())
+
+
+def _strategy_code_equivalent(left: str, right: str) -> bool:
+    left_norm = _normalize_strategy_code(left)
+    right_norm = _normalize_strategy_code(right)
+    return bool(left_norm) and left_norm == right_norm
+
+
+DUPLICATE_CODE_RECENT_NODE_LIMIT = 10
+FORBIDDEN_STRATEGY_MAX_EXAMPLES = 6
+FORBIDDEN_STRATEGY_MAX_CHARS = 1800
+PARENT_CODEGEN_FAIL_COOL_THRESHOLD = 2
+DUPLICATE_RECOVERY_TEMPERATURE = 0.3
+PLATEAU_NON_IMPROVE_THRESHOLD = 8
+PLATEAU_IMPROVE_ADV_EPS = 1.0
+PLATEAU_IMPROVE_SURPLUS_EPS = PLATEAU_IMPROVE_ADV_EPS
+ELITE_PARENT_BIAS_PROB = 0.0
+HYPOTHESIS_JUMP_PROB = 0.0
+PLATEAU_ESCAPE_TEMPERATURE = 0.5
+PLATEAU_ESCAPE_MODES = ("revision", "combination")
+CODEGEN_RECOVERY_MODES = ("plan_guided", "legacy")
+DEFAULT_CODEGEN_RECOVERY_MODE = "legacy"
+
+MODEL_ALIASES = {
+    "llama": "models/Meta-Llama-3-8B-Instruct",
+    "qwen": "models/Qwen2.5-Coder-32B-Instruct",
+}
+DEFAULT_MODEL_ALIAS = "llama"
+
+
+def resolve_model_name(model: Optional[str] = None) -> str:
+    key = (model or DEFAULT_MODEL_ALIAS).strip()
+    if key in MODEL_ALIASES:
+        return MODEL_ALIASES[key]
+    return key
+
+
+def _truncate_strategy_code(code: str, *, max_chars: int = FORBIDDEN_STRATEGY_MAX_CHARS) -> str:
+    text = str(code or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 20].rstrip() + "\n# ... truncated ..."
+
+
+def _collect_forbidden_strategy_examples(
+    parent: Any,
+    tree: Any,
+    *,
+    max_examples: int = FORBIDDEN_STRATEGY_MAX_EXAMPLES,
+    max_chars: int = FORBIDDEN_STRATEGY_MAX_CHARS,
+) -> List[Dict[str, Any]]:
+    examples: List[Dict[str, Any]] = []
+    sibling_ids = sorted(
+        (int(sid) for sid in (getattr(parent, "children", None) or [])),
+        reverse=True,
+    )
+    for sibling_id in sibling_ids:
+        if len(examples) >= max_examples:
+            break
+        try:
+            sibling = tree.get(sibling_id)
+        except Exception:
+            continue
+        code = getattr(sibling, "code", None)
+        if not code or not str(code).strip():
+            continue
+        examples.append(
+            {
+                "node_id": sibling_id,
+                "role": "sibling",
+                "code": _truncate_strategy_code(str(code), max_chars=max_chars),
+            }
+        )
+    return examples
+
+
+def _duplicate_strategy_rejection_message(
+    code: str,
+    *,
+    parent: Any,
+    tree: Any,
+    recent_limit: int = DUPLICATE_CODE_RECENT_NODE_LIMIT,
+) -> Optional[str]:
+    if not code or not str(code).strip():
+        return None
+
+    candidates: Dict[int, Any] = {}
+    parent_id = int(getattr(parent, "node_id", -1))
+    if parent_id > 0:
+        candidates[parent_id] = parent
+
+    sibling_ids = set(getattr(parent, "children", None) or [])
+    for sibling_id in sibling_ids:
+        try:
+            candidates[int(sibling_id)] = tree.get(int(sibling_id))
+        except Exception:
+            continue
+
+    evaluable_ids = []
+    if hasattr(tree, "evaluable_node_ids"):
+        evaluable_ids = [int(nid) for nid in tree.evaluable_node_ids()]
+    recent_ids = sorted(evaluable_ids, reverse=True)[: max(0, int(recent_limit))]
+    for node_id in recent_ids:
+        try:
+            candidates[int(node_id)] = tree.get(int(node_id))
+        except Exception:
+            continue
+
+    for node_id, node in sorted(candidates.items()):
+        other = getattr(node, "code", None)
+        if not other or not str(other).strip():
+            continue
+        if not _strategy_code_equivalent(code, str(other)):
+            continue
+        if node_id == parent_id:
+            role = "parent"
+        elif node_id in sibling_ids:
+            role = "sibling"
+        else:
+            role = "recent tree node"
+        return (
+            f"Generated strategy is identical or equivalent to existing {role} "
+            f"(node {node_id}). Do not return a duplicate of any strategy already in "
+            f"the tree (parent, siblings, or the last {int(recent_limit)} nodes). "
+            "Stay under the parent principle+form, but change the shade expression "
+            "so probe shades differ; comments, renames, whitespace, or "
+            "AST-identical clones are not enough."
+        )
+    return None
+
+
+def _critic_system_prompt(
+    q_reward_mode: str,
+    critic_mode: str = "default",
+    *,
+    strategy_type: str = "pv",
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    spread_omit_fundamental: bool = False,
+) -> str:
+    if critic_mode == "structured_principle_form":
+        return _structured_principle_form_system_prompt(
+            strategy_type=strategy_type,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+            spread_omit_fundamental=spread_omit_fundamental,
+        )
+    if q_reward_mode == "zi_beat_fraction":
+        return CRITIC_SYSTEM_PROMPT_ZI
+    if q_reward_mode == "zi_advantage":
+        return CRITIC_SYSTEM_PROMPT_ZI_ADVANTAGE
+    return CRITIC_SYSTEM_PROMPT
+
+
+
+
+def _compact_case_card_from_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    cards = payload.get("case_cards")
+    if not cards:
+        return None
+    card = dict(cards[0])
+    card.pop("worst", None)
+    card.pop("prior_hold", None)
+    return card
+
+
+def _attach_prior_hold_card(
+    batch_data: Dict[str, Any],
+    card: Dict[str, Any],
+) -> Dict[str, Any]:
+    out = dict(batch_data)
+    prior = dict(card)
+    prior["prior_hold"] = True
+    prior.pop("worst", None)
+    out["prior_hold_card"] = prior
+    return out
+
+
+def _compress_batch_data_for_critic(
+    batch_data: Dict[str, Any],
+    *,
+    max_interactions: int = 8,
+) -> Dict[str, Any]:
+    if not isinstance(batch_data, dict) or not batch_data.get("configs"):
+        payload: Dict[str, Any] = {"case_cards": [], "worst_market": None, "tapes": {}}
+    else:
+        payload = build_case_card_payload(
+            batch_data,
+            max_interactions=max_interactions,
+        )
+    prior = batch_data.get("prior_hold_card") if isinstance(batch_data, dict) else None
+    if isinstance(prior, dict) and prior:
+        payload["prior_hold_card"] = dict(prior)
+    return payload
+
+
+def _estimate_critic_prompt_tokens(*parts: str) -> int:
+    return sum(len(part) for part in parts) // CRITIC_CHARS_PER_TOKEN + 1
+
+
+
+
+def _is_critic_context_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "context length" in message
+        or "max_tokens" in message
+        or "max_completion_tokens" in message
+    )
+
+
+def _critic_max_output_tokens(*, system_content: str, prompt: str) -> int:
+    est_input = _estimate_critic_prompt_tokens(system_content, prompt)
+    remaining = CRITIC_CONTEXT_LIMIT - est_input - 32
+    return max(64, min(CRITIC_MAX_OUTPUT_TOKENS, remaining))
+
+
+def _reflection_from_completion(response: Any, *, label: str = "critic") -> str:
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    finish = getattr(choice, "finish_reason", None)
+    if finish == "length":
+        print(
+            f"[reflection] WARNING: {label} output hit max_tokens "
+            f"(finish_reason=length, chars={len(text)}). Reflection may be "
+            "incomplete — raise CRITIC_MAX_OUTPUT_TOKENS or shrink the prompt.",
+            flush=True,
+        )
+    return text
+
+
+_REFLECTION_SECTION_HEADERS = (
+    "## Prior Parent Reflection",
+    "## Parent reflection",
+    "## Parent Hypothesis (DIAGNOSIS — implement this experiment)",
+)
+
+
+def _cap_user_prompt_preserving_reflection(
+    prompt: str,
+    *,
+    max_chars: int,
+    label: str,
+) -> str:
+    text = prompt or ""
+    if len(text) <= max_chars:
+        return text
+
+    def _shrink_code_fences(src: str, budget: int) -> str:
+        fences = list(
+            re.finditer(r"```python\n(.*?)```", src, flags=re.DOTALL)
+        )
+        if not fences:
+            return src
+        pieces = []
+        last = 0
+        bodies = []
+        for m in fences:
+            pieces.append(src[last : m.start(1)])
+            bodies.append(m.group(1))
+            last = m.end(1)
+        pieces.append(src[last:])
+        while True:
+            rebuilt = "".join(
+                pieces[i] + bodies[i] for i in range(len(bodies))
+            ) + pieces[-1]
+            if len(rebuilt) <= budget:
+                return rebuilt
+            idx = max(range(len(bodies)), key=lambda i: len(bodies[i]))
+            body = bodies[idx]
+            if len(body) <= 200:
+                return rebuilt
+            keep = max(120, len(body) // 2)
+            bodies[idx] = body[:keep].rstrip() + "\n# ... truncated ...\n"
+
+    shrunk = _shrink_code_fences(text, max_chars)
+    if len(shrunk) <= max_chars:
+        if shrunk != text:
+            print(
+                f"[reflection] WARNING: {label} prompt over context budget "
+                f"({len(text)}>{max_chars} chars); shrunk strategy code, "
+                "kept full parent reflection.",
+                flush=True,
+            )
+        return shrunk
+
+    keep_end = None
+    for header in _REFLECTION_SECTION_HEADERS:
+        start = shrunk.find(header)
+        if start < 0:
+            continue
+        after = shrunk.find("\n## ", start + len(header))
+        keep_end = len(shrunk) if after < 0 else after
+        break
+    if keep_end is not None and keep_end <= max_chars:
+        head = shrunk[:keep_end].rstrip()
+        tail_note = (
+            f"\n\n[...{label} prompt truncated after reflection "
+            "for context window; reply with a valid DIAGNOSIS...]\n"
+        )
+        out = head + tail_note
+        if len(out) <= max_chars:
+            print(
+                f"[reflection] WARNING: {label} prompt still over budget after "
+                f"code shrink ({len(text)} chars); truncated post-reflection "
+                "instructions, kept full reflection.",
+                flush=True,
+            )
+            return out
+
+    for header in _REFLECTION_SECTION_HEADERS:
+        start = shrunk.find(header)
+        if start >= 0 and start < max_chars - 200:
+            pass
+    out = (
+        shrunk[: max_chars - 80].rstrip()
+        + f"\n\n[...{label} prompt truncated for context window...]\n"
+    )
+    print(
+        f"[reflection] WARNING: {label} prompt hard-truncated "
+        f"({len(text)}->{len(out)} chars); reflection may be incomplete.",
+        flush=True,
+    )
+    return out
+
+
+def _apply_learning_prompt_options(
+    prompt: str,
+    *,
+    batch_summary: Optional[Dict[str, Any]] = None,
+    learning_lessons: Optional[List[str]] = None,
+    learning_falsify_zero_trade: bool = False,
+    learning_falsify_shade_collapse: bool = False,
+    learning_lesson_memory: bool = False,
+) -> str:
+    if (
+        not learning_falsify_zero_trade
+        and not learning_falsify_shade_collapse
+        and not (learning_lesson_memory and learning_lessons)
+    ):
+        return prompt
+    return prepend_learning_prompt_sections(
+        prompt,
+        batch_summary=batch_summary,
+        lessons=learning_lessons if learning_lesson_memory else None,
+        falsify_zero_trade=bool(learning_falsify_zero_trade),
+        falsify_shade_collapse=bool(learning_falsify_shade_collapse),
+    )
+
+
+def _prepare_critic_prompt(
+    *,
+    code: str,
+    batch_summary: Dict[str, Any],
+    batch_data: Dict[str, Any],
+    reward: float,
+    reward_variance: float,
+    include_data: bool,
+    q_reward_mode: str = "advantage",
+    critic_mode: str = "default",
+    strategy_type: str = "pv",
+    run_explored_pairs: Optional[Set[Tuple[str, str]]] = None,
+    menu_exploration_enabled: bool = True,
+    lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+    spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    require_last_hold_comparison: Optional[bool] = None,
+    learning_lessons: Optional[List[str]] = None,
+    learning_falsify_zero_trade: bool = False,
+    learning_falsify_shade_collapse: bool = False,
+    learning_lesson_memory: bool = False,
+    learning_force_menu_replace: bool = False,
+    learning_outcome_first: bool = False,
+) -> Tuple[str, int, str]:
+    system_prompt = _critic_system_prompt(
+        q_reward_mode,
+        critic_mode=critic_mode,
+        strategy_type=strategy_type,
+        lob_input_mode=lob_input_mode,
+        spread_input_mode=spread_input_mode,
+    )
+    if require_last_hold_comparison is None:
+        require_last_hold_comparison = bool(
+            isinstance(batch_data, dict) and batch_data.get("prior_hold_card")
+        )
+
+    def _finalize(prompt: str) -> Tuple[str, int, str]:
+        prompt = _apply_learning_prompt_options(
+            prompt,
+            batch_summary=batch_summary,
+            learning_lessons=learning_lessons,
+            learning_falsify_zero_trade=learning_falsify_zero_trade,
+            learning_falsify_shade_collapse=learning_falsify_shade_collapse,
+            learning_lesson_memory=learning_lesson_memory,
+        )
+        return (
+            prompt,
+            _critic_max_output_tokens(system_content=system_prompt, prompt=prompt),
+            system_prompt,
+        )
+
+    if not include_data:
+        prompt = build_reflection_prompt(
+            code=code,
+            batch_summary=batch_summary,
+            batch_data=batch_data if include_data else {},
+            reward=reward,
+            reward_variance=reward_variance,
+            include_data=False,
+            q_reward_mode=q_reward_mode,
+            critic_mode=critic_mode,
+            strategy_type=strategy_type,
+            run_explored_pairs=run_explored_pairs,
+            menu_exploration_enabled=menu_exploration_enabled,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+            require_last_hold_comparison=require_last_hold_comparison,
+            force_menu_replace=learning_force_menu_replace,
+            outcome_first=learning_outcome_first,
+        )
+        return _finalize(prompt)
+
+    for limit in CRITIC_INTERACTION_LIMITS:
+        compressed = _compress_batch_data_for_critic(batch_data, max_interactions=limit)
+        prompt = build_reflection_prompt(
+            code=code,
+            batch_summary=batch_summary,
+            batch_data=compressed,
+            reward=reward,
+            reward_variance=reward_variance,
+            include_data=True,
+            q_reward_mode=q_reward_mode,
+            critic_mode=critic_mode,
+            strategy_type=strategy_type,
+            run_explored_pairs=run_explored_pairs,
+            menu_exploration_enabled=menu_exploration_enabled,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+            require_last_hold_comparison=require_last_hold_comparison,
+            force_menu_replace=learning_force_menu_replace,
+            outcome_first=learning_outcome_first,
+        )
+        if len(prompt) <= CRITIC_MAX_PROMPT_CHARS:
+            return _finalize(prompt)
+
+    prompt = build_reflection_prompt(
+        code=code,
+        batch_summary=batch_summary,
+        batch_data={},
+        reward=reward,
+        reward_variance=reward_variance,
+        include_data=False,
+        q_reward_mode=q_reward_mode,
+        critic_mode=critic_mode,
+        strategy_type=strategy_type,
+        run_explored_pairs=run_explored_pairs,
+        menu_exploration_enabled=menu_exploration_enabled,
+        lob_input_mode=lob_input_mode,
+        spread_input_mode=spread_input_mode,
+        require_last_hold_comparison=require_last_hold_comparison,
+        force_menu_replace=learning_force_menu_replace,
+        outcome_first=learning_outcome_first,
+    )
+    return _finalize(prompt)
+
+
+
+
+def _reflection_preview(reflection: str, *, max_chars: int = 160) -> str:
+    flat = (reflection or "").replace("\n", " ")
+    fields = parse_principle_form_fields(reflection or "")
+    direction = fields.get("shade_error_direction")
+    prefix = f"dir={direction} | " if direction else ""
+    body = flat[: max(0, max_chars - len(prefix))]
+    return f"{prefix}{body}"
+
+
+def _format_reward_stats(reward: float, reward_variance: float) -> str:
+    return f"reward={reward:.4f} reward_var={reward_variance:.4f}"
+
+
+def _performance_payload(
+    *,
+    reward: float,
+    reward_variance: float,
+    per_config_rewards: Dict[str, float],
+    per_config_reward_variances: Dict[str, float],
+    overall: Optional[Dict[str, Any]] = None,
+    zi_benchmark_comparison: Optional[Dict[str, Any]] = None,
+    batch_data: Optional[Dict[str, Any]] = None,
+    reward_mode: str = "advantage",
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "reward": float(reward),
+        "reward_variance": float(reward_variance),
+        "per_config_rewards": dict(per_config_rewards),
+        "per_config_reward_variances": dict(per_config_reward_variances),
+    }
+    if overall is not None:
+        payload["overall"] = overall
+    if isinstance(batch_data, dict) and batch_data.get("configs"):
+        metrics = summarize_per_config_performance(batch_data, reward_mode=reward_mode)
+        for label, row in metrics.items():
+            cfg = row.get("config")
+            if isinstance(cfg, dict):
+                row["config"] = {"label": cfg.get("label", label)}
+        payload["per_config_metrics"] = metrics
+    if zi_benchmark_comparison is not None:
+        payload["zi_benchmark_comparison"] = zi_benchmark_comparison
+    return payload
+
+
+def _build_batch_summary_for_critic(
+    pipeline: "ReflectionPipeline",
+    *,
+    reward: float,
+    reward_variance: float,
+    per_config_rewards: Dict[str, float],
+    per_config_reward_variances: Dict[str, float],
+    batch_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    return build_critic_batch_summary(
+        reward=reward,
+        reward_variance=reward_variance,
+        per_config_rewards=per_config_rewards,
+        per_config_reward_variances=per_config_reward_variances,
+        batch_data=batch_data,
+        reward_mode=pipeline.reward_mode,
+        per_config_breakdown=pipeline.critic_per_config_metrics,
+    )
+
+
+def _critic_prompt_inputs(
+    pipeline: "ReflectionPipeline",
+    *,
+    reward: float,
+    reward_variance: float,
+    per_config_rewards: Dict[str, float],
+    per_config_reward_variances: Dict[str, float],
+    batch_data: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Any]:
+    if not pipeline.critic_include_data:
+        return {}, {}
+    batch_summary = _build_batch_summary_for_critic(
+        pipeline,
+        reward=reward,
+        reward_variance=reward_variance,
+        per_config_rewards=per_config_rewards,
+        per_config_reward_variances=per_config_reward_variances,
+        batch_data=batch_data,
+    )
+    compressed_data = _compress_batch_data_for_critic(batch_data)
+    return batch_summary, compressed_data
 
 
 class StrategyGenerator:
@@ -52,31 +994,92 @@ class StrategyGenerator:
         *,
         parent_code: str,
         parent_reflection: str,
-        batch_context: List[Dict[str, Any]],
         strategy_output_mode: str,
         offline_example: Optional[Dict[str, Any]],
+        strategy_type: str = "full",
+        use_reflection: bool = True,
+        parent_performance: Optional[Dict[str, Any]] = None,
+        generator_batch_summary: Optional[Dict[str, Any]] = None,
+        generator_batch_data: Optional[Dict[str, Any]] = None,
+        sibling_code: Optional[str] = None,
+        sibling_context: Optional[Dict[str, Any]] = None,
+        q_reward_mode: str = "advantage",
+        critic_mode: str = "default",
+        forbid_numpy_random: bool = False,
+        forbidden_strategies: Optional[List[Dict[str, Any]]] = None,
+        extra_instructions: Optional[List[str]] = None,
+        temperature: float = 0.2,
+        lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+        spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+        learning_lessons: Optional[List[str]] = None,
+        learning_falsify_zero_trade: bool = False,
+        learning_falsify_shade_collapse: bool = False,
+        learning_lesson_memory: bool = False,
+        outcome_first: bool = False,
     ) -> str:
         prompt = build_generation_prompt(
             parent_code=parent_code,
             parent_reflection=parent_reflection,
-            batch_context=batch_context,
             strategy_output_mode=strategy_output_mode,
             market_description=DEFAULT_MARKET_DESCRIPTION,
             offline_example=offline_example,
+            strategy_type=strategy_type,
+            use_reflection=use_reflection,
+            parent_performance=parent_performance,
+            generator_batch_summary=generator_batch_summary,
+            generator_batch_data=generator_batch_data,
+            sibling_code=sibling_code,
+            sibling_context=sibling_context,
+            q_reward_mode=q_reward_mode,
+            critic_mode=critic_mode,
+            forbid_numpy_random=forbid_numpy_random,
+            forbidden_strategies=forbidden_strategies,
+            extra_instructions=extra_instructions,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+            outcome_first=outcome_first,
         )
-        return self._generator.generate_code(prompt)
+        prompt = _apply_learning_prompt_options(
+            prompt,
+            batch_summary=generator_batch_summary,
+            learning_lessons=learning_lessons,
+            learning_falsify_zero_trade=learning_falsify_zero_trade,
+            learning_falsify_shade_collapse=learning_falsify_shade_collapse,
+            learning_lesson_memory=learning_lesson_memory,
+        )
+        return self._generator.generate_code(prompt, temperature=float(temperature))
 
-    def debug(self, *, code: str, error: str) -> str:
-        prompt = build_debug_prompt(code=code, error=error)
-        return self._generator.generate_code(prompt)
+    def debug(
+        self,
+        *,
+        code: str,
+        error: str,
+        forbidden_strategies: Optional[List[Dict[str, Any]]] = None,
+        force_new_form: bool = False,
+        temperature: float = 0.2,
+        parent_reflection: Optional[str] = None,
+        plan_guided_recovery: bool = False,
+        critic_mode: str = "default",
+        strategy_type: str = "pv",
+    ) -> str:
+        prompt = build_debug_prompt(
+            code=code,
+            error=error,
+            forbidden_strategies=forbidden_strategies,
+            force_new_form=force_new_form,
+            parent_reflection=parent_reflection,
+            plan_guided_recovery=plan_guided_recovery,
+            critic_mode=critic_mode,
+            strategy_type=strategy_type,
+        )
+        return self._generator.generate_code(prompt, temperature=float(temperature))
 
 
 class ReflectionCritic:
-    DEFAULT_BASE_URL = "http://aries.cs.rutgers.edu:8000/v1"
+    DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
     DEFAULT_API_KEY = "dummy"
     DEFAULT_MODEL_NAME = "models/Meta-Llama-3-8B-Instruct"
     FALLBACK_BASE_URLS = [
-        "http://aries.cs.rutgers.edu:8000/v1",
         "http://127.0.0.1:8000/v1",
         "http://localhost:8000/v1",
     ]
@@ -97,30 +1100,305 @@ class ReflectionCritic:
         self._model_name = model_name or os.getenv("OPENAI_MODEL") or self.DEFAULT_MODEL_NAME
         self._client = OpenAI(base_url=resolved_base_url, api_key=resolved_api_key)
 
-    def generate(self, *, code: str, batch_summary: Dict[str, Any], reward: float) -> str:
-        prompt = build_reflection_prompt(code=code, batch_summary=batch_summary, reward=reward)
+    def generate(
+        self,
+        *,
+        code: str,
+        batch_summary: Dict[str, Any],
+        batch_data: Any,
+        reward: float,
+        reward_variance: float = 0.0,
+        include_data: bool = True,
+        q_reward_mode: str = "advantage",
+        critic_mode: str = "default",
+        strategy_type: str = "pv",
+        parent_reflection: Optional[str] = None,
+        sibling_reflections: Optional[List[str]] = None,
+        run_explored_pairs: Optional[Set[Tuple[str, str]]] = None,
+        menu_exploration_enabled: bool = True,
+        lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+        spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+        learning_lessons: Optional[List[str]] = None,
+        learning_falsify_zero_trade: bool = False,
+        learning_falsify_shade_collapse: bool = False,
+        learning_lesson_memory: bool = False,
+        learning_force_menu_replace: bool = False,
+        learning_outcome_first: bool = False,
+    ) -> str:
+        require_last_hold_comparison = bool(
+            isinstance(batch_data, dict) and batch_data.get("prior_hold_card")
+        )
+        prompt, max_tokens, system_prompt = _prepare_critic_prompt(
+            code=code,
+            batch_summary=batch_summary,
+            batch_data=batch_data if isinstance(batch_data, dict) else {},
+            reward=reward,
+            reward_variance=reward_variance,
+            include_data=include_data,
+            q_reward_mode=q_reward_mode,
+            critic_mode=critic_mode,
+            strategy_type=strategy_type,
+            run_explored_pairs=run_explored_pairs,
+            menu_exploration_enabled=menu_exploration_enabled,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+            require_last_hold_comparison=require_last_hold_comparison,
+            learning_lessons=learning_lessons,
+            learning_falsify_zero_trade=learning_falsify_zero_trade,
+            learning_falsify_shade_collapse=learning_falsify_shade_collapse,
+            learning_lesson_memory=learning_lesson_memory,
+            learning_force_menu_replace=learning_force_menu_replace,
+            learning_outcome_first=learning_outcome_first,
+        )
         last_error = None
         for candidate_url in self._base_url_candidates:
             try:
                 self._client = OpenAI(base_url=candidate_url, api_key=self._api_key)
-                response = self._client.chat.completions.create(
-                    model=self._model_name,
-                    messages=[
-                        {"role": "system", "content": "Return a concise 3-part reflection."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                    max_tokens=512,
-                )
-                return response.choices[0].message.content.strip()
+                validation_feedback: Optional[str] = None
+                reflection = ""
+                for attempt in range(2):
+                    user_prompt = prompt
+                    if validation_feedback:
+                        revision_hint = (
+                            "Reply again with a valid DIAGNOSIS block and MECHANISM/FIX only."
+                        )
+                        user_prompt = (
+                            f"{prompt}\n\n"
+                            "## Revision Required\n"
+                            f"Your prior reflection was rejected: {validation_feedback}\n"
+                            f"{revision_hint}"
+                        )
+                    response = self._client.chat.completions.create(
+                        model=self._model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.2,
+                        max_tokens=max_tokens,
+                    )
+                    reflection = _reflection_from_completion(
+                        response, label="main critic"
+                    )
+                    if is_structured_principle_form(critic_mode):
+                        validation_error = validate_structured_principle_form_reflection(
+                            reflection,
+                            strategy_type=strategy_type,
+                            parent_reflection=parent_reflection,
+                            sibling_reflections=sibling_reflections,
+                            run_explored_pairs=run_explored_pairs,
+                            require_last_hold_comparison=require_last_hold_comparison,
+                            force_menu_replace=learning_force_menu_replace,
+                            lob_input_mode=lob_input_mode,
+                            spread_input_mode=spread_input_mode,
+                        )
+                    else:
+                        return reflection
+                    if not validation_error:
+                        return reflection
+                    if attempt == 0:
+                        validation_feedback = validation_error
+                        continue
+                    return reflection
+                return reflection
             except Exception as exc:
                 last_error = exc
                 if "Connection error" in str(exc):
                     continue
+                if include_data and _is_critic_context_error(exc):
+                    prompt, max_tokens, system_prompt = _prepare_critic_prompt(
+                        code=code,
+                        batch_summary=batch_summary,
+                        batch_data={},
+                        reward=reward,
+                        reward_variance=reward_variance,
+                        include_data=False,
+                        q_reward_mode=q_reward_mode,
+                        critic_mode=critic_mode,
+                        strategy_type=strategy_type,
+                        run_explored_pairs=run_explored_pairs,
+                        menu_exploration_enabled=menu_exploration_enabled,
+                        lob_input_mode=lob_input_mode,
+                        spread_input_mode=spread_input_mode,
+                        require_last_hold_comparison=require_last_hold_comparison,
+                        learning_lessons=learning_lessons,
+                        learning_falsify_zero_trade=learning_falsify_zero_trade,
+                        learning_falsify_shade_collapse=learning_falsify_shade_collapse,
+                        learning_lesson_memory=learning_lesson_memory,
+                        learning_force_menu_replace=learning_force_menu_replace,
+                        learning_outcome_first=learning_outcome_first,
+                    )
+                    include_data = False
+                    validation_feedback = None
+                    continue
                 raise
         if last_error is not None:
             raise last_error
-        return "Environment: unknown\nPerformance: unknown\nFix: unknown"
+        if critic_mode == "structured_principle_form":
+            return _fallback_principle_form_diagnosis(
+                strategy_type=strategy_type,
+                lob_input_mode=lob_input_mode,
+                spread_input_mode=spread_input_mode,
+            )
+        return (
+            "DIAGNOSIS:\n"
+            "  shade_error_direction: reshape_pv_map\n"
+            "  error_type: pv_mapping_wrong\n"
+            "  fix_class: change_pv_feature\n"
+            "  consensus: n/a\n"
+            "MECHANISM: unknown\n"
+            "FIX: unknown\n"
+        )
+
+    def generate_plateau_revision(
+        self,
+        *,
+        prompt: str,
+        critic_mode: str,
+        stalled_form_class: Optional[str] = None,
+        stalled_principle: Optional[str] = None,
+        strategy_type: str = "pv",
+        temperature: float = 0.4,
+        run_explored_pairs: Optional[Set[Tuple[str, str]]] = None,
+        lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+        spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+    ) -> str:
+        system_prompt = _critic_system_prompt(
+            "zi_advantage",
+            critic_mode,
+            strategy_type=strategy_type,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+        )
+        if critic_mode == "structured_principle_form":
+            base = _structured_principle_form_system_prompt(
+                strategy_type=strategy_type,
+                lob_input_mode=lob_input_mode,
+                spread_input_mode=spread_input_mode,
+            )
+            system_prompt = (
+                base
+                + " This is a plateau revision: pick a different principle and a "
+                "different form_class than the stalled hypothesis and explain why "
+                "local edits failed."
+            )
+        user_prompt = _cap_user_prompt_preserving_reflection(
+            prompt,
+            max_chars=CRITIC_MAX_PROMPT_CHARS,
+            label="plateau",
+        )
+        last_error = None
+        for candidate_url in self._base_url_candidates:
+            try:
+                self._client = OpenAI(base_url=candidate_url, api_key=self._api_key)
+                truncated_retry = False
+                while True:
+                    validation_feedback: Optional[str] = None
+                    reflection = ""
+                    try:
+                        for attempt in range(2):
+                            request_prompt = user_prompt
+                            if validation_feedback:
+                                request_prompt = (
+                                    f"{user_prompt}\n\n"
+                                    "## Revision Required\n"
+                                    f"Your prior reflection was rejected: {validation_feedback}\n"
+                                    "Reply again with a valid DIAGNOSIS that revises the stalled "
+                                    "hypothesis (different principle and form_class)."
+                                )
+                            response = self._client.chat.completions.create(
+                                model=self._model_name,
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": request_prompt},
+                                ],
+                                temperature=float(temperature),
+                                max_tokens=CRITIC_MAX_OUTPUT_TOKENS,
+                            )
+                            reflection = _reflection_from_completion(
+                                response, label="plateau revision critic"
+                            )
+                            if not is_structured_principle_form(critic_mode):
+                                return reflection
+                            validation_error = validate_structured_principle_form_reflection(
+                                reflection,
+                                strategy_type=strategy_type,
+                                run_explored_pairs=run_explored_pairs,
+                                lob_input_mode=lob_input_mode,
+                                spread_input_mode=spread_input_mode,
+                            )
+                            if not validation_error and (
+                                stalled_form_class or stalled_principle
+                            ):
+                                fields = parse_principle_form_fields(reflection)
+                                new_form = fields.get("form_class")
+                                new_principle = fields.get("principle")
+                                if (
+                                    stalled_form_class
+                                    and new_form
+                                    and new_form == stalled_form_class
+                                ):
+                                    validation_error = (
+                                        f"form_class must differ from stalled form_class "
+                                        f"({stalled_form_class})"
+                                    )
+                                elif (
+                                    stalled_principle
+                                    and new_principle
+                                    and new_principle == stalled_principle
+                                ):
+                                    validation_error = (
+                                        f"principle must differ from stalled principle "
+                                        f"({stalled_principle})"
+                                    )
+                            if not validation_error:
+                                return reflection
+                            if attempt == 0:
+                                validation_feedback = validation_error
+                                continue
+                            return reflection
+                        return reflection
+                    except Exception as inner_exc:
+                        if (
+                            _is_critic_context_error(inner_exc)
+                            and not truncated_retry
+                        ):
+                            print(
+                                "[reflection] plateau revision context overflow; "
+                                "retrying with truncated prompt...",
+                                flush=True,
+                            )
+                            user_prompt = _cap_user_prompt_preserving_reflection(
+                                user_prompt,
+                                max_chars=max(2000, CRITIC_MAX_PROMPT_CHARS // 3),
+                                label="plateau-retry",
+                            )
+                            user_prompt = (
+                                user_prompt.rstrip()
+                                + "\n\nReply with DIAGNOSIS (different principle and "
+                                "form_class), MECHANISM, FIX only.\n"
+                            )
+                            truncated_retry = True
+                            continue
+                        raise
+            except Exception as exc:
+                last_error = exc
+                if "Connection error" in str(exc):
+                    continue
+                break
+        if last_error is not None:
+            print(
+                f"[reflection] plateau revision failed ({last_error}); "
+                "using heuristic escape DIAGNOSIS",
+                flush=True,
+            )
+        return _fallback_plateau_diagnosis(
+            strategy_type=strategy_type,
+            lob_input_mode=lob_input_mode,
+            spread_input_mode=spread_input_mode,
+        )
+
+
 
 
 class ReflectionPipeline:
@@ -128,10 +1406,11 @@ class ReflectionPipeline:
         self,
         *,
         config_pool: Optional[List[ReflectionMarketConfig]] = None,
+        config_space: Optional[ReflectionConfigSpace] = None,
         batch_size: int = 2,
         steps: int = 3,
         episodes_per_config: int = 2,
-        exploration_constant: float = 1.0,
+        exploration_constant: float = 3.0,
         max_debug_retries: int = 3,
         storage_dir: str = "llm_calls_reflection_pipeline",
         output_path: str = "results/reflection_pipeline_summary.json",
@@ -140,9 +1419,80 @@ class ReflectionPipeline:
         reward_mode: str = "advantage",
         fixed_strategy_code: Optional[str] = None,
         critic_enabled: bool = True,
+        critic_include_data: bool = True,
+        critic_per_config_metrics: bool = False,
+        generator_include_critic_data: bool = False,
+        generator_include_sibling: bool = False,
         run_dir: Optional[str] = None,
+        initial_strategy_types: Optional[List[str]] = None,
+        q_eval_mode: Optional[Literal["incremental", "full_refresh"]] = None,
+        q_update_mode: Optional[Literal["replace", "average"]] = None,
+        q_reward_mode: Optional[Literal["advantage", "zi_beat_fraction", "zi_advantage"]] = None,
+        parent_selection_mode: Optional[Literal["auto", "ucb", "newest"]] = None,
+        recipe_id: Optional[str] = None,
+        inactive_gate_enabled: bool = True,
+        inactive_gate_min_nodes: int = INACTIVE_GATE_MIN_NODES,
+        inactive_surplus_gap: float = INACTIVE_SURPLUS_GAP,
+        inactive_beat_gap: int = INACTIVE_BEAT_GAP,
+        critic_mode: Optional[str] = None,
+        zi_benchmark_shade_ranges: Optional[List[List[float]]] = None,
+        forbid_numpy_random: bool = False,
+        parent_codegen_fail_cool_threshold: int = PARENT_CODEGEN_FAIL_COOL_THRESHOLD,
+        plateau_escape_enabled: bool = True,
+        plateau_non_improve_threshold: int = PLATEAU_NON_IMPROVE_THRESHOLD,
+        plateau_improve_surplus_eps: float = PLATEAU_IMPROVE_SURPLUS_EPS,
+        plateau_improve_adv_eps: Optional[float] = None,
+        elite_parent_bias_prob: float = ELITE_PARENT_BIAS_PROB,
+        hypothesis_jump_prob: float = HYPOTHESIS_JUMP_PROB,
+        plateau_escape_temperature: float = PLATEAU_ESCAPE_TEMPERATURE,
+        plateau_escape_mode: str = "revision",
+        principle_menu_preset: Optional[str] = None,
+        menu_exploration_enabled: bool = True,
+        codegen_recovery_mode: str = DEFAULT_CODEGEN_RECOVERY_MODE,
+        lob_input_mode: str = DEFAULT_LOB_INPUT_MODE,
+        spread_input_mode: str = DEFAULT_SPREAD_INPUT_MODE,
+        spread_omit_fundamental: bool = False,
+        background_agent_kind: str = DEFAULT_BACKGROUND_AGENT_KIND,
+        background_zip_fixed_mu: Optional[float] = None,
+        background_zip_initial_mu: Optional[float] = None,
+        background_zip_zi_warmup_steps: int = 25,
+        parallel_episodes: bool = False,
+        parallel_episode_workers: Optional[int] = None,
+        skip_zi_benchmarks: bool = False,
+        q_refresh_top_k: int = Q_REFRESH_TOP_K,
+        q_refresh_always_recent: int = Q_REFRESH_ALWAYS_RECENT,
+        q_refresh_episode_workers: int = Q_REFRESH_EPISODE_WORKERS,
+        model_name: Optional[str] = None,
+        market_block_size: int = 0,
+        q_suite_size: int = 3,
+        menu_sweep_markets: int = 0,
+        menu_sweep_on_home_set: bool = False,
+        home_set_size: int = 0,
+        resample_every: int = 0,
+        prompt_profile: str = "standard",
+        lob_seed_scale: str = DEFAULT_LOB_SEED_SCALE,
+        learning_falsify_zero_trade: bool = False,
+        learning_falsify_shade_collapse: bool = False,
+        learning_reject_noop_edits: bool = False,
+        learning_parent_max_children: int = 20,
+        learning_lesson_memory: bool = False,
+        learning_structural_recovery: bool = False,
+        learning_force_menu_replace: bool = False,
+        learning_outcome_first: bool = False,
+        suite_aggregate: str = "mean",
+        suite_aggregate_lambda: float = 0.5,
     ) -> None:
-        self.config_pool = config_pool or build_default_config_pool()
+        from marketsim.LLM.reflection_pipeline.prompt_profile import (
+            activate_prompt_profile,
+        )
+
+        self.prompt_profile = activate_prompt_profile(prompt_profile)
+        if config_pool is not None:
+            self._config_pool = config_pool
+            self._config_space = None
+        else:
+            self._config_pool = None
+            self._config_space = config_space or build_default_config_space()
         self.batch_size = max(1, int(batch_size))
         self.steps = max(1, int(steps))
         self.episodes_per_config = max(1, int(episodes_per_config))
@@ -158,20 +1508,367 @@ class ReflectionPipeline:
         self.seed = seed
         self.strategy_output_mode = strategy_output_mode
         self.reward_mode = reward_mode
+        from marketsim.LLM.reflection_pipeline.evaluation import (
+            DEFAULT_SUITE_AGGREGATE,
+            DEFAULT_SUITE_AGGREGATE_LAMBDA,
+            SUITE_AGGREGATE_MODES,
+        )
+
+        self.suite_aggregate = str(suite_aggregate or DEFAULT_SUITE_AGGREGATE).lower()
+        if self.suite_aggregate not in SUITE_AGGREGATE_MODES:
+            raise ValueError(
+                f"Unsupported suite_aggregate: {suite_aggregate!r}; "
+                f"expected one of {SUITE_AGGREGATE_MODES}"
+            )
+        self.suite_aggregate_lambda = float(
+            suite_aggregate_lambda
+            if suite_aggregate_lambda is not None
+            else DEFAULT_SUITE_AGGREGATE_LAMBDA
+        )
         self.fixed_strategy_code = fixed_strategy_code
         self.critic_enabled = critic_enabled
+        self.critic_include_data = bool(critic_include_data)
+        self.critic_per_config_metrics = bool(critic_per_config_metrics)
+        self.generator_include_critic_data = bool(generator_include_critic_data)
+        self.generator_include_sibling = bool(generator_include_sibling)
+        self.q_eval_mode = q_eval_mode or DEFAULT_Q_EVAL_MODE
+        if self.q_eval_mode not in {"incremental", "full_refresh"}:
+            raise ValueError(f"Unsupported q_eval_mode: {self.q_eval_mode}")
+        self.q_update_mode = q_update_mode or DEFAULT_Q_UPDATE_MODE
+        if self.q_update_mode not in {"replace", "average"}:
+            raise ValueError(f"Unsupported q_update_mode: {self.q_update_mode}")
+        self.q_reward_mode = q_reward_mode or DEFAULT_Q_REWARD_MODE
+        if self.q_reward_mode not in {"advantage", "zi_beat_fraction", "zi_advantage"}:
+            raise ValueError(f"Unsupported q_reward_mode: {self.q_reward_mode}")
+        if self.q_reward_mode in ZI_Q_REWARD_MODES:
+            self.generator_include_critic_data = True
+        if self.q_reward_mode == "zi_beat_fraction" and self.q_eval_mode == "full_refresh":
+            print(
+                "[reflection] zi_beat_fraction forces q_eval_mode=incremental "
+                "(no full Q refresh)",
+                flush=True,
+            )
+            self.q_eval_mode = "incremental"
+        self.parent_selection_mode = parent_selection_mode or DEFAULT_PARENT_SELECTION_MODE
+        if self.parent_selection_mode not in PARENT_SELECTION_MODES:
+            raise ValueError(
+                f"Unsupported parent_selection_mode: {self.parent_selection_mode}"
+            )
+        self.recipe_id = recipe_id
+        self.inactive_gate_enabled = bool(inactive_gate_enabled)
+        self.inactive_gate_min_nodes = max(1, int(inactive_gate_min_nodes))
+        self.inactive_surplus_gap = float(inactive_surplus_gap)
+        self.inactive_beat_gap = max(0, int(inactive_beat_gap))
+        self.critic_mode = critic_mode or DEFAULT_CRITIC_MODE
+        if self.critic_mode not in CRITIC_MODES:
+            raise ValueError(f"Unsupported critic_mode: {self.critic_mode}")
+        self.zi_benchmark_shade_ranges = (
+            [list(r) for r in zi_benchmark_shade_ranges]
+            if zi_benchmark_shade_ranges is not None
+            else None
+        )
+        self.forbid_numpy_random = bool(forbid_numpy_random)
+        self.parent_codegen_fail_cool_threshold = max(
+            1, int(parent_codegen_fail_cool_threshold)
+        )
+        self.plateau_escape_enabled = bool(plateau_escape_enabled)
+        self.plateau_non_improve_threshold = max(1, int(plateau_non_improve_threshold))
+        self.plateau_improve_surplus_eps = float(plateau_improve_surplus_eps)
+        self.plateau_improve_adv_eps = float(
+            PLATEAU_IMPROVE_ADV_EPS
+            if plateau_improve_adv_eps is None
+            else plateau_improve_adv_eps
+        )
+        self.elite_parent_bias_prob = min(1.0, max(0.0, float(elite_parent_bias_prob)))
+        self.hypothesis_jump_prob = min(1.0, max(0.0, float(hypothesis_jump_prob)))
+        self.plateau_escape_temperature = float(plateau_escape_temperature)
+        resolved_escape_mode = str(plateau_escape_mode or "revision").strip().lower()
+        if resolved_escape_mode not in PLATEAU_ESCAPE_MODES:
+            raise ValueError(
+                f"Unsupported plateau_escape_mode: {plateau_escape_mode!r} "
+                f"(expected one of {PLATEAU_ESCAPE_MODES})"
+            )
+        self.plateau_escape_mode = resolved_escape_mode
+        self.principle_menu_preset = (
+            str(principle_menu_preset).strip() if principle_menu_preset else None
+        ) or None
+        set_principle_menu_preset(self.principle_menu_preset)
+        self.menu_exploration_enabled = bool(menu_exploration_enabled)
+        resolved_codegen_recovery = str(
+            codegen_recovery_mode or DEFAULT_CODEGEN_RECOVERY_MODE
+        ).strip().lower()
+        if resolved_codegen_recovery not in CODEGEN_RECOVERY_MODES:
+            raise ValueError(
+                f"Unsupported codegen_recovery_mode: {codegen_recovery_mode!r} "
+                f"(expected one of {CODEGEN_RECOVERY_MODES})"
+            )
+        self.codegen_recovery_mode = resolved_codegen_recovery
+        self.lob_input_mode = normalize_lob_input_mode(lob_input_mode)
+        self.spread_input_mode = normalize_spread_input_mode(spread_input_mode)
+        self.spread_omit_fundamental = bool(spread_omit_fundamental)
+        set_spread_omit_fundamental(self.spread_omit_fundamental)
+        self.background_agent_kind = normalize_background_agent_kind(
+            background_agent_kind
+        )
+        self.background_zip_fixed_mu = (
+            float(background_zip_fixed_mu)
+            if background_zip_fixed_mu is not None
+            else None
+        )
+        self.background_zip_initial_mu = (
+            abs(float(background_zip_initial_mu))
+            if background_zip_initial_mu is not None
+            else None
+        )
+        self.background_zip_zi_warmup_steps = max(
+            0, int(background_zip_zi_warmup_steps)
+        )
+        self.parallel_episodes = bool(parallel_episodes)
+        self.parallel_episode_workers = (
+            int(parallel_episode_workers)
+            if parallel_episode_workers is not None
+            else None
+        )
+        self.skip_zi_benchmarks = bool(skip_zi_benchmarks)
+        self.q_refresh_top_k = max(0, int(q_refresh_top_k))
+        self.q_refresh_always_recent = max(0, int(q_refresh_always_recent))
+        self.q_refresh_episode_workers = max(1, int(q_refresh_episode_workers))
+        self.model_name = resolve_model_name(model_name)
+        self.market_block_size = max(0, int(market_block_size))
+        self.q_suite_size = max(1, int(q_suite_size))
+        self.menu_sweep_markets = max(0, int(menu_sweep_markets))
+        self.menu_sweep_on_home_set = bool(menu_sweep_on_home_set)
+        self.home_set_size = max(0, int(home_set_size))
+        self.resample_every = max(0, int(resample_every))
+        self.lob_seed_scale = normalize_lob_seed_scale(lob_seed_scale)
+        self.learning_falsify_zero_trade = bool(learning_falsify_zero_trade)
+        self.learning_falsify_shade_collapse = bool(learning_falsify_shade_collapse)
+        self.learning_reject_noop_edits = bool(learning_reject_noop_edits)
+        self.learning_parent_max_children = max(0, int(learning_parent_max_children))
+        self.learning_lesson_memory = bool(learning_lesson_memory)
+        self.learning_structural_recovery = bool(learning_structural_recovery)
+        self.learning_force_menu_replace = bool(learning_force_menu_replace)
+        self.learning_outcome_first = bool(learning_outcome_first)
+        self._learning_lessons = LessonMemory()
+        if self.home_set_size > 0 and self._config_space is None:
+            raise ValueError(
+                "home_set_size>0 requires a config_space (do not use a fixed "
+                "config_pool / --fixed-curriculum-market)."
+            )
+        if self.home_set_size > 0 and self.market_block_size > 0:
+            raise ValueError(
+                "home_set_size and market_block_size cannot be used together."
+            )
+        if self.menu_sweep_on_home_set and self.menu_sweep_markets > 0:
+            raise ValueError(
+                "menu_sweep_on_home_set and menu_sweep_markets cannot be used together."
+            )
+        if self.menu_sweep_on_home_set and self.home_set_size <= 0:
+            raise ValueError(
+                "menu_sweep_on_home_set requires home_set_size>0 "
+                "(sweep every menu pair once on the stratified homeset)."
+            )
+        if self.menu_sweep_on_home_set and self._config_space is None:
+            raise ValueError(
+                "menu_sweep_on_home_set requires a config_space (do not use a fixed "
+                "config_pool / --fixed-curriculum-market)."
+            )
+        if self.menu_sweep_on_home_set and self.market_block_size > 0:
+            raise ValueError(
+                "menu_sweep_on_home_set and market_block_size cannot be used together."
+            )
+        if self.home_set_size > 0 and self.menu_sweep_markets > 0:
+            raise ValueError(
+                "home_set_size and menu_sweep_markets cannot be used together "
+                "(use menu_sweep_on_home_set for a homeset menu warmup)."
+            )
+        if self.resample_every > 0 and self._config_space is None:
+            raise ValueError(
+                "resample_every>0 requires a config_space (do not use a fixed "
+                "config_pool / --fixed-curriculum-market)."
+            )
+        if self.resample_every > 0 and self.market_block_size > 0:
+            raise ValueError(
+                "resample_every and market_block_size cannot be used together."
+            )
+        if self.resample_every > 0 and self.menu_sweep_markets > 0:
+            raise ValueError(
+                "resample_every and menu_sweep_markets cannot be used together "
+                "(use menu_sweep_on_home_set for a homeset warmup before resample)."
+            )
+        if self.market_block_size > 0 and self._config_space is None:
+            raise ValueError(
+                "market_block_size>0 requires a config_space (do not use a fixed "
+                "config_pool / --fixed-curriculum-market)."
+            )
+        if self.menu_sweep_markets > 0:
+            if self._config_space is None:
+                raise ValueError(
+                    "menu_sweep_markets>0 requires a config_space (do not use a fixed "
+                    "config_pool / --fixed-curriculum-market)."
+                )
+            if self.principle_menu_preset != "min2":
+                raise ValueError(
+                    "menu_sweep_markets>0 requires --principle-menu-preset min2 "
+                    f"(got {self.principle_menu_preset!r})."
+                )
+        self._sweep_markets: List[ReflectionMarketConfig] = []
+        self._block_markets: List[ReflectionMarketConfig] = []
+        self._force_hypothesis_pair: Optional[Tuple[str, str]] = None
+        self._force_parent_id: Optional[int] = None
+        self._force_train_configs: Optional[List[ReflectionMarketConfig]] = None
+        self._force_q_configs: Optional[List[ReflectionMarketConfig]] = None
 
         self._rng = random.Random(seed)
-        self._tree = RefinementTree(root_code=DEFAULT_STRATEGY_CODE)
+        self._home_set: List[ReflectionMarketConfig] = []
+        if self.home_set_size > 0 and (
+            self.resample_every <= 0 or self.menu_sweep_on_home_set
+        ):
+            self._home_set = sample_stratified_home_set(
+                self._config_space,
+                self._rng,
+                size=self.home_set_size,
+                exclude=build_default_config_pool(),
+            )
+            self.batch_size = self.home_set_size
+            self.critic_per_config_metrics = True
+            if self.menu_sweep_on_home_set:
+                print(
+                    "[reflection] home set for menu sweep ("
+                    f"{self.home_set_size} markets; one node per menu pair; "
+                    "critic sees opaque per-market rows):",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[reflection] home set (frozen "
+                    f"{self.home_set_size} markets; critic sees opaque per-market rows):",
+                    flush=True,
+                )
+            for cfg in self._home_set:
+                state = cfg.observable_state()
+                print(
+                    f"[reflection]   {cfg.label}: buy={state['num_zi_buy']} "
+                    f"sell={state['num_zi_sell']} t={state['timesteps']} "
+                    f"q_max={state['q_max']} shade={state['shade_range']} "
+                    f"arrival={state['arrival_rate']}",
+                    flush=True,
+                )
+            if (
+                self.resample_every > 0
+                and self._config_space is not None
+                and self._home_set
+            ):
+                wide = resample_market_shade_ranges()
+                self._config_space.shade_ranges = [list(r) for r in wide]
+                print(
+                    "[reflection] expanded config_space.shade_ranges for post-homeset "
+                    f"resample redraws: {[r[-1] for r in wide]} "
+                    "(homeset/slot0 unchanged; holdout ood_cells still excluded)",
+                    flush=True,
+                )
+        self._resample_slots: List[List[ReflectionMarketConfig]] = []
+        self._resample_needs_q_realign = False
+        if self.resample_every > 0:
+            if self.home_set_size > 0:
+                self.batch_size = self.home_set_size
+                self.critic_per_config_metrics = True
+                print(
+                    "[reflection] stratified resample-every="
+                    f"{self.resample_every} (hold {self.home_set_size} stratified "
+                    f"markets for {self.resample_every} steps; train=Q; then redraw; "
+                    "holdout ood_cells excluded)",
+                    flush=True,
+                )
+            else:
+                self.batch_size = 1
+                print(
+                    "[reflection] resample-every="
+                    f"{self.resample_every} (hold 1 sampled market for "
+                    f"{self.resample_every} steps; train=Q; then redraw; "
+                    "holdout ood_cells excluded)",
+                    flush=True,
+                )
+        self._tree = RefinementTree(
+            initial_types=initial_strategy_types,
+            lob_input_mode=self.lob_input_mode,
+            lob_seed_scale=self.lob_seed_scale,
+            spread_input_mode=self.spread_input_mode,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+        )
         self._total_visits = 1
         self._storage = CodeStorage(self.storage_dir)
         self._verifier = StrategyVerifier()
-        self._generator = StrategyGenerator()
-        self._critic = ReflectionCritic() if critic_enabled else None
-        self._code_iteration = 0
-        self._offline_example = None
-        self._offline_example_path = str(Path(self.output_path).parent / "offline_zi_example.json")
-        self._prepare_offline_example()
+        self._generator = StrategyGenerator(model_name=self.model_name)
+        self._critic = (
+            ReflectionCritic(model_name=self.model_name) if critic_enabled else None
+        )
+        self._q_refresh_history: List[Dict[str, Any]] = []
+
+    def _store_node_performance(self, node_id: int, performance: Dict[str, Any]) -> None:
+        self._tree.get(node_id).metadata["performance"] = performance
+
+    def _store_node_generator_context(
+        self,
+        node_id: int,
+        *,
+        reward: float,
+        reward_variance: float,
+        per_config_rewards: Dict[str, float],
+        per_config_reward_variances: Dict[str, float],
+        batch_data: Optional[Dict[str, Any]],
+    ) -> None:
+        if not batch_data:
+            return
+        batch_summary = _build_batch_summary_for_critic(
+            self,
+            reward=reward,
+            reward_variance=reward_variance,
+            per_config_rewards=per_config_rewards,
+            per_config_reward_variances=per_config_reward_variances,
+            batch_data=batch_data,
+        )
+        compressed_data = _compress_batch_data_for_critic(
+            batch_data,
+            max_interactions=GENERATOR_INTERACTION_LIMIT,
+        )
+        node = self._tree.get(node_id)
+        node.metadata["generator_batch_summary"] = batch_summary
+        stored = dict(compressed_data)
+        prior = stored.pop("prior_hold_card", None)
+        if prior is None and isinstance(batch_data, dict):
+            prior = batch_data.get("prior_hold_card")
+        node.metadata["generator_batch_data"] = stored
+        hold_card = _compact_case_card_from_payload(stored)
+        if hold_card:
+            node.metadata["hold_case_card"] = hold_card
+        if isinstance(prior, dict) and prior:
+            node.metadata["prior_hold_case_card"] = dict(prior)
+
+    def _parent_generator_context_for_generation(
+        self,
+        parent_id: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if not self.generator_include_critic_data:
+            return None, None
+        parent = self._tree.get(parent_id)
+        summary = parent.metadata.get("generator_batch_summary")
+        data = parent.metadata.get("generator_batch_data")
+        if isinstance(summary, dict) and summary and isinstance(data, dict) and data:
+            return summary, data
+        return None, None
+
+    def _parent_performance_for_generation(self, parent_id: int) -> Dict[str, Any]:
+        parent = self._tree.get(parent_id)
+        performance = parent.metadata.get("performance")
+        if isinstance(performance, dict) and performance:
+            return dict(performance)
+        return {
+            "reward": float(parent.q_value),
+            "reward_variance": 0.0,
+            "per_config_rewards": {},
+            "per_config_reward_variances": {},
+        }
 
     def _resolve_run_paths(self, *, storage_dir: str, output_path: str) -> Tuple[str, str]:
         if self.run_dir:
@@ -190,24 +1887,1223 @@ class ReflectionPipeline:
         resolved_output = str(base_dir / "reflection_pipeline_summary.json")
         return resolved_storage, resolved_output
 
-    def _prepare_offline_example(self) -> None:
-        self._offline_example = load_offline_example(self._offline_example_path)
-        if self._offline_example is not None:
-            return
-        if not self.config_pool:
-            return
-        example_config = self.config_pool[0]
-        self._offline_example = generate_offline_example(
-            config=example_config,
-            seed=self.seed,
-            output_path=self._offline_example_path,
-            max_events=30,
+
+
+
+    def _resample_slot_index(self, step_index: int) -> int:
+        return max(0, int(step_index)) // self.resample_every
+
+
+
+    def _all_resampled_configs(self) -> List[ReflectionMarketConfig]:
+        return [cfg for slot in self._resample_slots for cfg in slot]
+
+    @property
+    def _resample_markets(self) -> List[ReflectionMarketConfig]:
+        return self._all_resampled_configs()
+
+
+    def _sample_resample_home_set(self, slot_index: int) -> List[ReflectionMarketConfig]:
+        if self._config_space is None:
+            raise RuntimeError("stratified resample requires config_space")
+        exclude = list(build_default_config_pool()) + self._all_resampled_configs()
+        label_offset = slot_index * max(1, self.home_set_size)
+        strata_offset = int(slot_index) if self.home_set_size == 1 else 0
+        return sample_stratified_home_set(
+            self._config_space,
+            self._rng,
+            size=self.home_set_size,
+            exclude=exclude,
+            label_offset=label_offset,
+            strata_offset=strata_offset,
         )
 
-    def _select_batch(self) -> List[ReflectionMarketConfig]:
-        if self.batch_size >= len(self.config_pool):
-            return list(self.config_pool)
-        return self._rng.sample(self.config_pool, self.batch_size)
+    def _ensure_resample_slot(self, step_index: int) -> List[ReflectionMarketConfig]:
+        if self.resample_every <= 0:
+            raise RuntimeError("_ensure_resample_slot called with resample_every=0")
+        slot_index = self._resample_slot_index(step_index)
+        while len(self._resample_slots) <= slot_index:
+            if self._resample_slots:
+                self._snapshot_prior_hold_cards()
+            if self.home_set_size <= 0:
+                raise RuntimeError("resample requires home_set_size > 0")
+            markets = self._sample_resample_home_set(len(self._resample_slots))
+            self._resample_slots.append(markets)
+            self._resample_needs_q_realign = len(self._resample_slots) > 1
+            labels = [cfg.label for cfg in markets]
+            print(
+                f"[reflection] resample slot {len(self._resample_slots) - 1}: "
+                f"hold {labels} for {self.resample_every} steps (train=Q)",
+                flush=True,
+            )
+            for cfg in markets:
+                state = cfg.observable_state()
+                print(
+                    f"[reflection]   {cfg.label}: buy={state['num_zi_buy']} "
+                    f"sell={state['num_zi_sell']} t={state['timesteps']} "
+                    f"q_max={state['q_max']} shade={state['shade_range']} "
+                    f"arrival={state['arrival_rate']}",
+                    flush=True,
+                )
+        return list(self._resample_slots[slot_index])
+
+
+    def _maybe_realign_q_for_resample(
+        self,
+        *,
+        step_index: int,
+        q_suite_configs: List[ReflectionMarketConfig],
+    ) -> None:
+        if not self._resample_needs_q_realign:
+            return
+        if self.q_eval_mode != "full_refresh":
+            self._resample_needs_q_realign = False
+            return
+        if not self._tree.evaluable_node_ids():
+            self._resample_needs_q_realign = False
+            return
+        suite = self._build_step_eval_suite(q_suite_configs, step_index=step_index)
+        labels = [cfg.label for cfg in q_suite_configs]
+        print(
+            f"[reflection] resample slot {self._resample_slot_index(step_index)}: "
+            f"realigning Q on {labels} before parent select "
+            f"(suite {suite.suite_id})",
+            flush=True,
+        )
+        started = time.perf_counter()
+        refresh_results = self._refresh_all_nodes(
+            suite=suite,
+            include_batch_data=False,
+            log_prefix="[reflection]",
+        )
+        refresh_entry = self._make_q_refresh_entry(
+            step=step_index,
+            phase="resample_realign",
+            refresh_results=refresh_results,
+            refresh_seconds=time.perf_counter() - started,
+            eval_suite=suite,
+        )
+        self._q_refresh_history.append(refresh_entry)
+        self._resample_needs_q_realign = False
+
+    def _is_resample_transfer_step(self, step_index: Optional[int]) -> bool:
+        if self.resample_every <= 0 or step_index is None:
+            return False
+        idx = int(step_index)
+        return idx > 0 and idx % self.resample_every == 0
+
+    def _previous_resample_slot(self) -> Optional[List[ReflectionMarketConfig]]:
+        if len(self._resample_slots) < 2:
+            return None
+        return list(self._resample_slots[-2])
+
+    def _previous_resample_market(self) -> Optional[ReflectionMarketConfig]:
+        prev = self._previous_resample_slot()
+        if not prev:
+            return None
+        return prev[0]
+
+    def _snapshot_prior_hold_cards(self) -> None:
+        n = 0
+        for node_id in self._tree.evaluable_node_ids():
+            node = self._tree.get(node_id)
+            card = node.metadata.get("hold_case_card")
+            if isinstance(card, dict) and card:
+                node.metadata["prior_hold_case_card"] = dict(card)
+                n += 1
+        if n:
+            print(
+                f"[reflection] snapshotted last-hold case cards for {n} node(s) "
+                "(stats only; used on the first step of the next hold)",
+                flush=True,
+            )
+
+    def _strategy_fn_from_node(self, node) -> Optional[Any]:
+        strategy_type = str(node.metadata.get("type", "full") or "full")
+        required_args, input_mode = self._strategy_type_params(strategy_type)
+        ok, _err, fn = self._verifier.verify(
+            node.code,
+            required_args=required_args,
+            input_mode=input_mode,
+            forbid_numpy_random=self.forbid_numpy_random,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+        )
+        if not ok:
+            return None
+        return fn
+
+    def _evaluate_compact_case_payload(
+        self,
+        *,
+        strategy_fn: Any,
+        config: ReflectionMarketConfig,
+        step_index: int,
+        strategy_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        result = self._evaluate_strategy_batch(
+            strategy_fn=strategy_fn,
+            batch_configs=[config],
+            step_index=step_index,
+            strategy_type=strategy_type,
+            include_batch_data=True,
+        )
+        if not result.batch_data:
+            return None
+        return _compress_batch_data_for_critic(
+            result.batch_data,
+            max_interactions=GENERATOR_INTERACTION_LIMIT,
+        )
+
+    def _attach_parent_transfer_cards(
+        self,
+        *,
+        parent: Any,
+        generator_batch_data: Optional[Dict[str, Any]],
+        strategy_type: str,
+        step_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        data = dict(generator_batch_data) if isinstance(generator_batch_data, dict) else {}
+        current_cfgs = list(self._force_train_configs or [])
+        fn = self._strategy_fn_from_node(parent)
+        if fn is not None and current_cfgs:
+            print(
+                f"[reflection] transfer test: parent {parent.node_id} on this hold "
+                f"{current_cfgs[0].label} (generator; Q unchanged)",
+                flush=True,
+            )
+            payload = self._evaluate_compact_case_payload(
+                strategy_fn=fn,
+                config=current_cfgs[0],
+                step_index=step_index,
+                strategy_type=strategy_type,
+            )
+            if payload:
+                data = dict(payload)
+                parent.metadata["generator_batch_data"] = dict(payload)
+                card = _compact_case_card_from_payload(payload)
+                if card:
+                    parent.metadata["hold_case_card"] = card
+        prior = parent.metadata.get("prior_hold_case_card")
+        if isinstance(prior, dict) and prior:
+            data = _attach_prior_hold_card(data, prior)
+        return data or generator_batch_data
+
+    def _second_test_prior_hold_card(
+        self,
+        *,
+        strategy_fn: Any,
+        strategy_type: str,
+        step_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        prev = self._previous_resample_market()
+        if prev is None:
+            return None
+        print(
+            f"[reflection] transfer test: same child on last hold {prev.label} "
+            "(critic; stats only, Q unchanged)",
+            flush=True,
+        )
+        payload = self._evaluate_compact_case_payload(
+            strategy_fn=strategy_fn,
+            config=prev,
+            step_index=int(step_index) + 30_000,
+            strategy_type=strategy_type,
+        )
+        return _compact_case_card_from_payload(payload)
+
+
+
+    def _train_and_q_configs(
+        self, step_index: int
+    ) -> Tuple[List[ReflectionMarketConfig], List[ReflectionMarketConfig]]:
+        if self._force_train_configs is not None:
+            train = list(self._force_train_configs)
+            suite = (
+                list(self._force_q_configs)
+                if self._force_q_configs is not None
+                else train
+            )
+            return train, suite
+        if self.home_set_size > 0 and self.resample_every <= 0:
+            home = list(self._home_set)
+            return home, home
+        if self.resample_every > 0:
+            markets = self._ensure_resample_slot(step_index)
+            return markets, markets
+        raise RuntimeError("refinement requires resample_every > 0 or a home set")
+
+    def _menu_sweep_pairs(self, strategy_type: str) -> List[Tuple[str, str]]:
+        return sorted(
+            menu_hypothesis_pairs(
+                strategy_type,
+                lob_input_mode=self.lob_input_mode,
+                spread_input_mode=self.spread_input_mode,
+            )
+        )
+
+    def _clear_step_force_overrides(self) -> None:
+        self._force_hypothesis_pair = None
+        self._force_parent_id = None
+        self._force_train_configs = None
+        self._force_q_configs = None
+
+    def _seed_node_for_strategy_type(self, strategy_type: str):
+        wanted = str(strategy_type or "").strip().lower()
+        for nid in self._tree.seed_node_ids():
+            node = self._tree.get(nid)
+            node_type = str((node.metadata or {}).get("type", "") or "").strip().lower()
+            if node_type == wanted:
+                return node
+        seed_ids = self._tree.seed_node_ids()
+        if not seed_ids:
+            raise RuntimeError("no seed nodes available to pin menu sweep parent")
+        return self._tree.get(seed_ids[0])
+
+    def _build_step_eval_suite(
+        self,
+        batch_configs: List[ReflectionMarketConfig],
+        *,
+        step_index: int,
+    ) -> FixedEvalSuite:
+        return build_fixed_eval_suite(
+            configs=batch_configs,
+            episodes_per_config=self.episodes_per_config,
+            base_seed=self.seed,
+            step_index=step_index,
+        )
+
+    def _node_specs(self, node_ids: Optional[List[int]] = None) -> List[Tuple[int, str, str]]:
+        ids = node_ids if node_ids is not None else self._tree.active_node_ids()
+        specs: List[Tuple[int, str, str]] = []
+        for node_id in ids:
+            node = self._tree.get(node_id)
+            strategy_type = str(node.metadata.get("type", "full"))
+            specs.append((node_id, node.code, strategy_type))
+        return specs
+
+    def _select_q_refresh_ids(
+        self, node_ids: Optional[List[int]] = None
+    ) -> List[int]:
+        candidates = (
+            list(node_ids)
+            if node_ids is not None
+            else list(self._tree.active_node_ids())
+        )
+        q_by_id = {
+            int(nid): float(self._tree.get(nid).q_value) for nid in candidates
+        }
+        return select_q_refresh_node_ids(
+            candidates,
+            q_by_id=q_by_id,
+            top_k=self.q_refresh_top_k,
+            always_recent=self.q_refresh_always_recent,
+        )
+
+    @staticmethod
+    def _node_live_q(node) -> Optional[float]:
+        try:
+            return float(node.q_value)
+        except Exception:
+            return None
+
+    def _store_creation_metrics(
+        self,
+        node_id: int,
+        *,
+        batch_data: Optional[Dict[str, Any]],
+        comparison: Optional[Dict[str, Any]],
+        reward: Optional[float] = None,
+    ) -> None:
+        del reward
+        node = self._tree.get(node_id)
+        mean_surplus = None
+        if comparison is not None and comparison.get("llm_mean_surplus") is not None:
+            mean_surplus = float(comparison["llm_mean_surplus"])
+        elif batch_data is not None:
+            overall = summarize_batch_performance(batch_data, reward_mode=self.reward_mode)
+            if overall.get("llm_surplus_mean") is not None:
+                mean_surplus = float(overall["llm_surplus_mean"])
+        if mean_surplus is not None:
+            node.metadata["mean_surplus"] = mean_surplus
+        if comparison is not None and comparison.get("beat_count") is not None:
+            node.metadata["zi_beat_count"] = int(comparison["beat_count"])
+            node.metadata["zi_total_benchmarks"] = int(comparison.get("total_benchmarks", 0))
+            node.metadata["zi_beat_fraction"] = float(comparison.get("beat_fraction", 0.0))
+
+
+
+    def _maybe_mark_inactive(self, node_id: int) -> bool:
+        del node_id
+        return False
+
+    def _note_parent_codegen_outcome(self, parent_id: int, *, success: bool) -> None:
+        if parent_id is None or int(parent_id) <= 0:
+            return
+        try:
+            parent = self._tree.get(int(parent_id))
+        except Exception:
+            return
+        if success:
+            parent.metadata["codegen_fail_streak"] = 0
+            return
+        streak = int(parent.metadata.get("codegen_fail_streak", 0)) + 1
+        parent.metadata["codegen_fail_streak"] = streak
+        if streak < self.parent_codegen_fail_cool_threshold:
+            print(
+                f"[reflection] parent {parent_id} codegen/verify fail streak={streak}/"
+                f"{self.parent_codegen_fail_cool_threshold}",
+                flush=True,
+            )
+            return
+        if bool(parent.metadata.get("inactive", False)):
+            return
+        seed_ids = set(self._tree.seed_node_ids())
+        seed_kind = str(parent.metadata.get("seed_kind") or "").strip().lower()
+        is_seed = int(parent_id) in seed_ids or seed_kind.startswith("hbl_")
+        if is_seed:
+            print(
+                f"[reflection] parent {parent_id} codegen/verify fail streak={streak}/"
+                f"{self.parent_codegen_fail_cool_threshold} "
+                f"(seed exempt from inactive cool; seed_kind={seed_kind or 'seed'})",
+                flush=True,
+            )
+            return
+        reason = (
+            f"codegen_fail_streak={streak} "
+            f"(threshold={self.parent_codegen_fail_cool_threshold})"
+        )
+        self._tree.mark_inactive(int(parent_id), reason=reason)
+        print(
+            f"[reflection] parent {parent_id} marked inactive ({reason}); "
+            "skipping future UCB parent selection",
+            flush=True,
+        )
+
+    def _refresh_all_nodes(
+        self,
+        *,
+        suite: FixedEvalSuite,
+        node_ids: Optional[List[int]] = None,
+        include_batch_data: bool = False,
+        log_prefix: str = "[reflection]",
+        apply_top_k: bool = True,
+    ) -> List[Dict[str, Any]]:
+        if apply_top_k:
+            selected_ids = self._select_q_refresh_ids(node_ids)
+        else:
+            selected_ids = (
+                list(node_ids)
+                if node_ids is not None
+                else list(self._tree.active_node_ids())
+            )
+        node_specs = self._node_specs(selected_ids)
+        if not node_specs:
+            return []
+
+        refresh_q_mode = (
+            "advantage" if self.q_reward_mode == "zi_advantage" else self.q_reward_mode
+        )
+        started = time.perf_counter()
+        outer_workers = max(1, min(len(node_specs), FULL_REFRESH_PARALLEL_WORKERS))
+        episode_workers = self.q_refresh_episode_workers
+        refresh_note = ""
+        if self.q_reward_mode == "zi_advantage":
+            refresh_note += "; advantage Q only, ZI benchmarks not refreshed"
+        if apply_top_k and self.q_refresh_top_k > 0:
+            refresh_note += (
+                f"; top_k={self.q_refresh_top_k} "
+                f"(always_recent={self.q_refresh_always_recent})"
+            )
+        print(
+            f"{log_prefix} refreshing Q for {len(node_specs)} node(s) "
+            f"on fixed suite {suite.suite_id} "
+            f"(node_workers={outer_workers}, "
+            f"episode_workers={episode_workers}{refresh_note})...",
+            flush=True,
+        )
+        if apply_top_k and node_ids is None:
+            active_n = len(self._tree.active_node_ids())
+            if active_n > len(selected_ids):
+                print(
+                    f"{log_prefix} Q refresh selected {selected_ids} "
+                    f"({len(selected_ids)}/{active_n} active)",
+                    flush=True,
+                )
+        results = refresh_nodes_parallel(
+            node_specs=node_specs,
+            suite=suite,
+            episodes_per_config=self.episodes_per_config,
+            base_seed=self.seed,
+            reward_mode=self.reward_mode,
+            strategy_output_mode=self.strategy_output_mode,
+            parallel_workers=outer_workers,
+            include_batch_data=include_batch_data,
+            q_reward_mode=refresh_q_mode,
+            lob_input_mode=self.lob_input_mode,
+            spread_input_mode=self.spread_input_mode,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+            background_agent_kind=self.background_agent_kind,
+            background_zip_fixed_mu=self.background_zip_fixed_mu,
+            background_zip_initial_mu=self.background_zip_initial_mu,
+            background_zip_zi_warmup_steps=self.background_zip_zi_warmup_steps,
+            parallel_episodes=True,
+            parallel_episode_workers=episode_workers,
+            skip_zi_benchmarks=True,
+            suite_aggregate=self.suite_aggregate,
+            suite_aggregate_lambda=self.suite_aggregate_lambda,
+        )
+        q_map: Dict[int, float] = {}
+        for result in results:
+            node_id = int(result["node_id"])
+            if result.get("success"):
+                q_map[node_id] = float(result["reward"])
+                batch_data = result.get("batch_data")
+                overall = None
+                if batch_data:
+                    overall = summarize_batch_performance(
+                        batch_data,
+                        reward_mode=self.reward_mode,
+                    )
+                prior = self._tree.get(node_id).metadata.get("performance") or {}
+                prior_zi = None
+                if isinstance(prior, dict):
+                    prior_zi = prior.get("zi_benchmark_comparison")
+                performance_payload = _performance_payload(
+                    reward=float(result["reward"]),
+                    reward_variance=float(result.get("reward_variance", 0.0)),
+                    per_config_rewards=result.get("per_config_rewards") or {},
+                    per_config_reward_variances=result.get("per_config_reward_variances") or {},
+                    overall=overall,
+                    zi_benchmark_comparison=(
+                        result.get("zi_benchmark_comparison")
+                        or prior_zi
+                    ),
+                    batch_data=batch_data if isinstance(batch_data, dict) else None,
+                    reward_mode=self.reward_mode,
+                )
+                self._store_node_performance(node_id, performance_payload)
+                suite_surplus = result.get("llm_mean_surplus")
+                if suite_surplus is None and overall is not None:
+                    suite_surplus = overall.get("llm_surplus_mean")
+                if suite_surplus is not None:
+                    self._tree.get(node_id).metadata["mean_surplus"] = float(suite_surplus)
+                self._store_node_generator_context(
+                    node_id,
+                    reward=float(result["reward"]),
+                    reward_variance=float(result.get("reward_variance", 0.0)),
+                    per_config_rewards=result.get("per_config_rewards") or {},
+                    per_config_reward_variances=result.get("per_config_reward_variances") or {},
+                    batch_data=batch_data,
+                )
+            else:
+                print(
+                    f"{log_prefix} node {node_id} refresh FAILED: {result.get('error')}",
+                    flush=True,
+                )
+        self._tree.apply_q_values(q_map, mode=self.q_update_mode)
+        elapsed = time.perf_counter() - started
+        print(
+            f"{log_prefix} Q refresh done in {elapsed:.1f}s "
+            f"(updated {len(q_map)} node(s))",
+            flush=True,
+        )
+        return results
+
+    def _make_q_refresh_entry(
+        self,
+        *,
+        step: int,
+        phase: str,
+        refresh_results: List[Dict[str, Any]],
+        refresh_seconds: float,
+        new_node_id: Optional[int] = None,
+        eval_suite: Optional[FixedEvalSuite] = None,
+    ) -> Dict[str, Any]:
+        q_values = {
+            str(int(item["node_id"])): float(self._tree.get(int(item["node_id"])).q_value)
+            for item in refresh_results
+            if item.get("success")
+        }
+        q_eval_counts = {
+            str(int(item["node_id"])): int(self._tree.get(int(item["node_id"])).metadata.get("q_eval_count", 0))
+            for item in refresh_results
+            if item.get("success")
+        }
+        q_variances = {
+            str(int(item["node_id"])): float(item["reward_variance"])
+            for item in refresh_results
+            if item.get("success") and item.get("reward_variance") is not None
+        }
+        return {
+            "step": step,
+            "phase": phase,
+            "new_node_id": new_node_id,
+            "eval_suite": eval_suite.to_dict() if eval_suite is not None else None,
+            "q_values": q_values,
+            "q_eval_counts": q_eval_counts,
+            "q_variances": q_variances,
+            "refresh_seconds": refresh_seconds,
+            "per_node": [
+                {
+                    "node_id": item["node_id"],
+                    "success": item.get("success"),
+                    "reward": item.get("reward"),
+                    "reward_variance": item.get("reward_variance"),
+                    "q_value": (
+                        float(self._tree.get(int(item["node_id"])).q_value)
+                        if item.get("success")
+                        else None
+                    ),
+                    "q_eval_count": (
+                        int(self._tree.get(int(item["node_id"])).metadata.get("q_eval_count", 0))
+                        if item.get("success")
+                        else None
+                    ),
+                    "error": item.get("error"),
+                }
+                for item in refresh_results
+            ],
+        }
+
+    def _evaluate_on_suite(
+        self,
+        *,
+        strategy_fn: Any,
+        suite: FixedEvalSuite,
+        strategy_type: str,
+        include_batch_data: bool = True,
+        strategy_code: Optional[str] = None,
+    ):
+        return self._evaluate_strategy_batch(
+            strategy_fn=strategy_fn,
+            batch_configs=suite.configs,
+            step_index=-1,
+            strategy_type=strategy_type,
+            include_batch_data=include_batch_data,
+            episode_seeds=suite.episode_seeds,
+            strategy_code=strategy_code,
+        )
+
+    def _evaluate_strategy_batch(
+        self,
+        *,
+        strategy_fn: Any,
+        batch_configs: List[ReflectionMarketConfig],
+        step_index: int,
+        strategy_type: str,
+        include_batch_data: bool = True,
+        episode_seeds: Optional[List[List[int]]] = None,
+        strategy_code: Optional[str] = None,
+    ):
+        common = dict(
+            strategy_fn=strategy_fn,
+            batch_configs=batch_configs,
+            episodes_per_config=self.episodes_per_config,
+            step_index=step_index,
+            base_seed=self.seed,
+            reward_mode=self.reward_mode,
+            max_events_per_episode=20,
+            strategy_output_mode=self.strategy_output_mode,
+            strategy_type=strategy_type,
+            episode_seeds=episode_seeds,
+            include_batch_data=include_batch_data,
+            lob_input_mode=self.lob_input_mode,
+            spread_input_mode=self.spread_input_mode,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+            background_agent_kind=self.background_agent_kind,
+            background_zip_fixed_mu=self.background_zip_fixed_mu,
+            background_zip_initial_mu=self.background_zip_initial_mu,
+            background_zip_zi_warmup_steps=self.background_zip_zi_warmup_steps,
+            parallel_episodes=self.parallel_episodes,
+            strategy_code=strategy_code,
+            suite_aggregate=self.suite_aggregate,
+            suite_aggregate_lambda=self.suite_aggregate_lambda,
+        )
+        if (
+            self.q_reward_mode in ZI_Q_REWARD_MODES
+            and not self.skip_zi_benchmarks
+        ):
+            return evaluate_batch_with_zi_benchmarks(
+                **common,
+                q_reward_mode=self.q_reward_mode,
+                zi_benchmark_shade_ranges=self.zi_benchmark_shade_ranges,
+                parallel_workers=(
+                    int(self.parallel_episode_workers)
+                    if self.parallel_episode_workers is not None
+                    else ZI_BENCHMARK_PARALLEL_WORKERS
+                ),
+                parallel_episode_workers=self.parallel_episode_workers,
+            )
+        return evaluate_batch(
+            **common,
+            special_agent_kind="llm",
+            parallel_workers=self.parallel_episode_workers,
+        )
+
+    def _format_step_eval_reward(self, eval_result) -> str:
+        base = _format_reward_stats(eval_result.reward, eval_result.reward_variance)
+        if eval_result.zi_benchmark_comparison:
+            comparison = eval_result.zi_benchmark_comparison
+            zi_line = (
+                f"zi_beat={comparison['beat_count']}/"
+                f"{comparison['total_benchmarks']} "
+                f"llm_mean_surplus={comparison['llm_mean_surplus']:.4f}"
+            )
+            if self.q_reward_mode == "zi_advantage" and eval_result.scalar_reward is not None:
+                zi_line += f" beat_fraction={float(eval_result.scalar_reward):.4f}"
+            if comparison.get("llm_mean_requested_x_cap") is not None:
+                zi_line += (
+                    f" llm_mean_x_cap={float(comparison['llm_mean_requested_x_cap']):.4f}"
+                )
+            if comparison.get("llm_mean_shade") is not None:
+                zi_line += (
+                    f" llm_trade_shade={float(comparison['llm_mean_shade']):.4f}"
+                )
+            return f"{base} {zi_line}"
+        return base
+
+    def _zi_comparison_from_batch(
+        self, batch_data: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(batch_data, dict):
+            return None
+        comparison = batch_data.get("zi_benchmark_comparison")
+        return comparison if isinstance(comparison, dict) else None
+
+    def _apply_zi_node_eval(
+        self,
+        node_id: int,
+        *,
+        comparison: Optional[Dict[str, Any]],
+    ) -> None:
+        if self.q_reward_mode != "zi_beat_fraction" or not comparison:
+            return
+        node = self._tree.get(node_id)
+        node.metadata["zi_beat_count"] = int(comparison.get("beat_count", 0))
+        node.metadata["zi_total_benchmarks"] = int(comparison.get("total_benchmarks", 0))
+        node.metadata["zi_beat_fraction"] = float(comparison.get("beat_fraction", 0.0))
+
+    def _resolved_parent_selection_mode(self) -> str:
+        if self.parent_selection_mode == "newest":
+            return "newest"
+        return "ucb"
+
+
+    def _select_parent_node(self):
+        if self._force_parent_id is not None:
+            parent = self._tree.get(int(self._force_parent_id))
+            return parent, "forced_seed"
+        mode = self._resolved_parent_selection_mode()
+        if mode == "newest":
+            return self._tree.select_newest(), "newest"
+        parent = self._tree.select_ucb(
+            exploration=self.exploration_constant,
+            total_visits=self._total_visits,
+            max_children=int(self.learning_parent_max_children or 0),
+        )
+        return parent, "ucb"
+
+    def _log_parent_selection(self, parent, *, select_mode: str = "ucb") -> None:
+        parent_type = parent.metadata.get("type", "full")
+        streak = int(parent.metadata.get("non_improve_streak", 0))
+        streak_note = (
+            f", non_improve_streak={streak}/{self.plateau_non_improve_threshold}"
+            if self.plateau_escape_enabled and streak > 0
+            else ""
+        )
+        if select_mode == "forced_seed":
+            print(
+                f"[reflection] forced seed parent node {parent.node_id} "
+                f"(type={parent_type}, q={parent.q_value:.4f}, visits={parent.visits}"
+                f"{streak_note})",
+                flush=True,
+            )
+            return
+        if select_mode == "newest":
+            print(
+                f"[reflection] newest-lineage parent node {parent.node_id} "
+                f"(type={parent_type}, q={parent.q_value:.4f}, visits={parent.visits}"
+                f"{streak_note})",
+                flush=True,
+            )
+            return
+        if select_mode == "elite":
+            surplus = parent.metadata.get("mean_surplus")
+            surplus_txt = f"{float(surplus):.2f}" if surplus is not None else "n/a"
+            print(
+                f"[reflection] elite parent node {parent.node_id} "
+                f"(type={parent_type}, q={parent.q_value:.4f}, "
+                f"surplus={surplus_txt}, visits={parent.visits}{streak_note})",
+                flush=True,
+            )
+            return
+        print(
+            f"[reflection] UCB parent node {parent.node_id} (type={parent_type}, "
+            f"q={parent.q_value:.4f}, visits={parent.visits}{streak_note})",
+            flush=True,
+        )
+
+    def _run_explored_hypothesis_pairs(self, strategy_type: str) -> Set[Tuple[str, str]]:
+        reflections: List[str] = []
+        for node in self._tree.nodes():
+            node_type = str((node.metadata or {}).get("type", "full") or "full")
+            if node_type != strategy_type:
+                continue
+            if node.reflection:
+                reflections.append(str(node.reflection))
+        return collect_hypothesis_pairs_from_reflections(reflections)
+
+    def _menu_coverage_summary(self) -> Dict[str, Any]:
+        if not is_structured_principle_form(self.critic_mode):
+            return {}
+        reflections_by_type: Dict[str, List[str]] = {}
+        for node in self._tree.nodes():
+            if node.node_id == 0:
+                continue
+            strategy_type = str((node.metadata or {}).get("type", "pv") or "pv")
+            if node.reflection:
+                reflections_by_type.setdefault(strategy_type, []).append(str(node.reflection))
+        return {
+            strategy_type: compute_menu_coverage_stats(
+                strategy_type=strategy_type,
+                reflections=reflections,
+                lob_input_mode=self.lob_input_mode,
+                spread_input_mode=self.spread_input_mode,
+            )
+            for strategy_type, reflections in sorted(reflections_by_type.items())
+        }
+
+    def _should_plateau_escape(self, parent) -> bool:
+        if not self.plateau_escape_enabled:
+            return False
+        streak = int(parent.metadata.get("non_improve_streak", 0))
+        return streak >= self.plateau_non_improve_threshold
+
+    def _generate_plateau_revision(self, parent) -> str:
+        fields = parse_principle_form_fields(parent.reflection or "")
+        summary, _data = self._parent_generator_context_for_generation(parent.node_id)
+        performance = self._parent_performance_for_generation(parent.node_id)
+        streak = int(parent.metadata.get("non_improve_streak", 0))
+        strategy_type = str(parent.metadata.get("type", "pv") or "pv")
+        explored_pairs = (
+            self._run_explored_hypothesis_pairs(strategy_type)
+            if self.menu_exploration_enabled
+            else None
+        )
+        prompt = build_plateau_revision_prompt(
+            parent_code=parent.code,
+            parent_reflection=parent.reflection or "",
+            parent_performance=performance,
+            non_improve_streak=streak,
+            critic_mode=self.critic_mode,
+            generator_batch_summary=summary if isinstance(summary, dict) else None,
+            strategy_type=strategy_type,
+            run_explored_pairs=explored_pairs,
+            lob_input_mode=self.lob_input_mode,
+            spread_input_mode=self.spread_input_mode,
+        )
+        if self._critic is None:
+            return _fallback_plateau_diagnosis(
+                strategy_type=strategy_type,
+                lob_input_mode=self.lob_input_mode,
+                spread_input_mode=self.spread_input_mode,
+            )
+        return self._critic.generate_plateau_revision(
+            prompt=prompt,
+            critic_mode=self.critic_mode,
+            stalled_form_class=fields.get("form_class"),
+            stalled_principle=fields.get("principle"),
+            strategy_type=strategy_type,
+            temperature=max(0.2, self.plateau_escape_temperature - 0.1),
+            run_explored_pairs=explored_pairs,
+            lob_input_mode=self.lob_input_mode,
+            spread_input_mode=self.spread_input_mode,
+        )
+
+
+
+
+
+
+    def _store_node_family_metadata(self, node_id: int, *, reflection: str, code: str) -> None:
+        try:
+            node = self._tree.get(int(node_id))
+        except Exception:
+            return
+        fields = parse_principle_form_fields(reflection or "")
+        if fields.get("principle"):
+            node.metadata["principle"] = fields["principle"]
+        if fields.get("form_class"):
+            node.metadata["form_class"] = fields["form_class"]
+        node.metadata["family_id"] = derive_family_id(
+            reflection=reflection or node.reflection or "",
+            code=code or node.code or "",
+            metadata=node.metadata,
+        )
+
+    def _note_parent_refine_outcome(
+        self,
+        parent_id: int,
+        *,
+        child_id: int,
+        escape_mode: bool,
+    ) -> None:
+        if not self.plateau_escape_enabled or int(parent_id) <= 0:
+            return
+        try:
+            parent = self._tree.get(int(parent_id))
+            child = self._tree.get(int(child_id))
+        except Exception:
+            return
+
+        parent_q = self._node_live_q(parent)
+        child_q = self._node_live_q(child)
+        improved = False
+        if parent_q is not None and child_q is not None:
+            improved = float(child_q) > (float(parent_q) + self.plateau_improve_adv_eps)
+
+        if escape_mode:
+            parent.metadata["non_improve_streak"] = 0
+            print(
+                f"[reflection] parent {parent_id}: plateau escape complete; "
+                f"non_improve_streak reset "
+                f"(child_q={child_q}, parent_q={parent_q}, improved={improved})",
+                flush=True,
+            )
+            return
+
+        if improved:
+            parent.metadata["non_improve_streak"] = 0
+            print(
+                f"[reflection] parent {parent_id}: refine improved Q; "
+                f"non_improve_streak reset "
+                f"(child_q={child_q}, parent_q={parent_q})",
+                flush=True,
+            )
+            return
+
+        streak = int(parent.metadata.get("non_improve_streak", 0)) + 1
+        parent.metadata["non_improve_streak"] = streak
+        print(
+            f"[reflection] parent {parent_id}: no Q improve "
+            f"(child_q={child_q}, parent_q={parent_q}); "
+            f"non_improve_streak={streak}/{self.plateau_non_improve_threshold}",
+            flush=True,
+        )
+
+    def _evaluate_seed_nodes_full_refresh(
+        self, suite: FixedEvalSuite
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        seed_ids = self._tree.seed_node_ids()
+        if not seed_ids:
+            return [], {}
+
+        if self.q_reward_mode == "zi_advantage" and not self.skip_zi_benchmarks:
+            return self._evaluate_seed_nodes_on_suite_with_zi(suite)
+
+        refresh_started = time.perf_counter()
+        refresh_results = self._refresh_all_nodes(
+            suite=suite,
+            node_ids=seed_ids,
+            include_batch_data=True,
+            log_prefix="[reflection] seed",
+        )
+        refresh_seconds = time.perf_counter() - refresh_started
+        refresh_entry = self._make_q_refresh_entry(
+            step=0,
+            phase="seed",
+            refresh_results=refresh_results,
+            refresh_seconds=refresh_seconds,
+            new_node_id=None,
+            eval_suite=suite,
+        )
+        results_by_id = {int(item["node_id"]): item for item in refresh_results}
+        seed_evaluations: List[Dict[str, Any]] = []
+
+        for node_id in seed_ids:
+            node = self._tree.get(node_id)
+            strategy_type = node.metadata.get("type", "full")
+            refresh_result = results_by_id.get(node_id)
+            if refresh_result is None or not refresh_result.get("success"):
+                seed_evaluations.append(
+                    {
+                        "node_id": node_id,
+                        "type": strategy_type,
+                        "success": False,
+                        "error": (
+                            refresh_result.get("error")
+                            if refresh_result is not None
+                            else "Missing refresh result"
+                        ),
+                    }
+                )
+                continue
+
+            reward = float(refresh_result["reward"])
+            reward_variance = float(refresh_result.get("reward_variance", 0.0))
+            per_config_rewards = refresh_result.get("per_config_rewards", {})
+            per_config_reward_variances = refresh_result.get("per_config_reward_variances", {})
+            batch_data = refresh_result.get("batch_data") or {"configs": []}
+            performance = summarize_batch_performance(
+                batch_data,
+                reward_mode=self.reward_mode,
+            )
+            performance_payload = _performance_payload(
+                reward=reward,
+                reward_variance=reward_variance,
+                per_config_rewards=per_config_rewards,
+                per_config_reward_variances=per_config_reward_variances,
+                overall=performance,
+                batch_data=batch_data,
+                reward_mode=self.reward_mode,
+            )
+            self._store_node_performance(node_id, performance_payload)
+            self._store_node_generator_context(
+                node_id,
+                reward=reward,
+                reward_variance=reward_variance,
+                per_config_rewards=per_config_rewards,
+                per_config_reward_variances=per_config_reward_variances,
+                batch_data=batch_data,
+            )
+            self._store_creation_metrics(
+                node_id,
+                batch_data=batch_data if isinstance(batch_data, dict) else None,
+                comparison=None,
+                reward=reward,
+            )
+            reflection = ""
+            if self.critic_enabled:
+                batch_summary, compressed_data = _critic_prompt_inputs(
+                    self,
+                    reward=reward,
+                    reward_variance=reward_variance,
+                    per_config_rewards=per_config_rewards,
+                    per_config_reward_variances=per_config_reward_variances,
+                    batch_data=batch_data,
+                )
+                reflection = self._generate_reflection(
+                    code=node.code,
+                    reward=reward,
+                    reward_variance=reward_variance,
+                    batch_summary=batch_summary,
+                    batch_data=compressed_data,
+                    batch_data_full=batch_data,
+                    strategy_type=str(strategy_type or "pv"),
+                )
+                self._tree.set_reflection(node_id, reflection)
+            else:
+                self._tree.set_reflection(node_id, "")
+            self._maybe_record_learning_lesson(
+                step_label=f"seed {node_id}",
+                batch_summary=locals().get("batch_summary"),
+                reflection=reflection,
+                note="seed eval",
+            )
+            print(
+                f"[reflection] seed node {node_id} ({strategy_type}) "
+                f"{_format_reward_stats(reward, reward_variance)} "
+                f"per_config={per_config_rewards}",
+                flush=True,
+            )
+            seed_evaluations.append(
+                {
+                    "node_id": node_id,
+                    "type": strategy_type,
+                    "success": True,
+                    "reward": reward,
+                    "reward_variance": reward_variance,
+                    "per_config_rewards": per_config_rewards,
+                    "per_config_reward_variances": per_config_reward_variances,
+                    "performance": performance_payload,
+                    "reflection": reflection,
+                }
+            )
+        return seed_evaluations, refresh_entry
+
+    def _evaluate_seed_nodes_on_suite_with_zi(
+        self, suite: FixedEvalSuite
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        seed_ids = self._tree.seed_node_ids()
+        seed_evaluations: List[Dict[str, Any]] = []
+        refresh_results: List[Dict[str, Any]] = []
+        refresh_started = time.perf_counter()
+        print(
+            f"[reflection] seed evaluating {len(seed_ids)} node(s) with ZI diagnostics "
+            f"on suite {suite.suite_id} (Q=advantage; later refreshes skip ZI)...",
+            flush=True,
+        )
+        for node_id in seed_ids:
+            node = self._tree.get(node_id)
+            strategy_type = node.metadata.get("type", "full")
+            required_args, input_mode = self._strategy_type_params(strategy_type)
+            ok, err, strategy_fn = self._verifier.verify(
+                node.code,
+                required_args=required_args,
+                input_mode=input_mode,
+                forbid_numpy_random=self.forbid_numpy_random,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+            )
+            if not ok or strategy_fn is None:
+                seed_evaluations.append(
+                    {
+                        "node_id": node_id,
+                        "type": strategy_type,
+                        "success": False,
+                        "error": err,
+                    }
+                )
+                refresh_results.append(
+                    {
+                        "node_id": node_id,
+                        "success": False,
+                        "error": err,
+                        "reward": float("-inf"),
+                    }
+                )
+                continue
+
+            eval_result = self._evaluate_on_suite(
+                strategy_fn=strategy_fn,
+                suite=suite,
+                strategy_type=strategy_type,
+                include_batch_data=True,
+                strategy_code=node.code,
+            )
+            overall = summarize_batch_performance(
+                eval_result.batch_data,
+                reward_mode=self.reward_mode,
+            )
+            performance_payload = _performance_payload(
+                reward=eval_result.reward,
+                reward_variance=eval_result.reward_variance,
+                per_config_rewards=eval_result.per_config_rewards,
+                per_config_reward_variances=eval_result.per_config_reward_variances,
+                overall=overall,
+                zi_benchmark_comparison=eval_result.zi_benchmark_comparison,
+                batch_data=eval_result.batch_data if isinstance(eval_result.batch_data, dict) else None,
+                reward_mode=self.reward_mode,
+            )
+            self._store_node_performance(node_id, performance_payload)
+            self._store_node_generator_context(
+                node_id,
+                reward=eval_result.reward,
+                reward_variance=eval_result.reward_variance,
+                per_config_rewards=eval_result.per_config_rewards,
+                per_config_reward_variances=eval_result.per_config_reward_variances,
+                batch_data=eval_result.batch_data,
+            )
+            self._store_creation_metrics(
+                node_id,
+                batch_data=eval_result.batch_data
+                if isinstance(eval_result.batch_data, dict)
+                else None,
+                comparison=eval_result.zi_benchmark_comparison,
+                reward=float(eval_result.reward),
+            )
+            reflection = ""
+            if self.critic_enabled:
+                batch_summary, compressed_data = _critic_prompt_inputs(
+                    self,
+                    reward=eval_result.reward,
+                    reward_variance=eval_result.reward_variance,
+                    per_config_rewards=eval_result.per_config_rewards,
+                    per_config_reward_variances=eval_result.per_config_reward_variances,
+                    batch_data=eval_result.batch_data,
+                )
+                reflection = self._generate_reflection(
+                    code=node.code,
+                    reward=eval_result.reward,
+                    reward_variance=eval_result.reward_variance,
+                    batch_summary=batch_summary,
+                    batch_data=compressed_data,
+                    batch_data_full=eval_result.batch_data,
+                    strategy_type=str(strategy_type or "pv"),
+                )
+                self._tree.set_reflection(node_id, reflection)
+            else:
+                self._tree.set_reflection(node_id, "")
+            self._maybe_record_learning_lesson(
+                step_label=f"seed {node_id}",
+                batch_summary=locals().get("batch_summary"),
+                reflection=reflection,
+                note="seed eval",
+            )
+            self._tree.update_q_value(
+                node_id,
+                eval_result.reward,
+                mode=self.q_update_mode,
+            )
+            print(
+                f"[reflection] seed node {node_id} ({strategy_type}) "
+                f"{self._format_step_eval_reward(eval_result)} "
+                f"per_config={eval_result.per_config_rewards}",
+                flush=True,
+            )
+            if self.critic_enabled and reflection:
+                print(
+                    f"[reflection] seed node {node_id} reflection "
+                    f"(preview: {_reflection_preview(reflection)}...)",
+                    flush=True,
+                )
+            seed_evaluations.append(
+                {
+                    "node_id": node_id,
+                    "type": strategy_type,
+                    "success": True,
+                    "reward": eval_result.reward,
+                    "reward_variance": eval_result.reward_variance,
+                    "per_config_rewards": eval_result.per_config_rewards,
+                    "per_config_reward_variances": eval_result.per_config_reward_variances,
+                    "performance": performance_payload,
+                    "reflection": reflection,
+                    "zi_benchmark_comparison": eval_result.zi_benchmark_comparison,
+                }
+            )
+            refresh_results.append(
+                {
+                    "node_id": node_id,
+                    "success": True,
+                    "error": None,
+                    "reward": float(eval_result.reward),
+                    "reward_variance": float(eval_result.reward_variance),
+                    "per_config_rewards": eval_result.per_config_rewards,
+                    "per_config_reward_variances": eval_result.per_config_reward_variances,
+                    "zi_benchmark_comparison": eval_result.zi_benchmark_comparison,
+                    "scalar_reward": eval_result.scalar_reward,
+                }
+            )
+
+        refresh_seconds = time.perf_counter() - refresh_started
+        refresh_entry = self._make_q_refresh_entry(
+            step=0,
+            phase="seed",
+            refresh_results=refresh_results,
+            refresh_seconds=refresh_seconds,
+            new_node_id=None,
+            eval_suite=suite,
+        )
+        return seed_evaluations, refresh_entry
+
+    def _strategy_type_params(self, strategy_type: str) -> Tuple[int, str]:
+        if strategy_type == "pv":
+            return 3, "pv"
+        requires_single_input = strategy_type in {"spread", "lob"}
+        required_args = 1 if requires_single_input else 3
+        if strategy_type == "lob" and is_lob_features_mode(self.lob_input_mode):
+            input_mode = "lob_features"
+        elif strategy_type == "lob" and is_lob_hbl_parity_mode(self.lob_input_mode):
+            input_mode = "lob_hbl_parity"
+        elif strategy_type == "lob" and is_lob_book_orders_mode(self.lob_input_mode):
+            input_mode = "lob_book_orders"
+        elif strategy_type == "spread" and is_spread_zip_parity_mode(self.spread_input_mode):
+            input_mode = "spread_zip_parity"
+        elif strategy_type == "spread" and is_spread_book_mode(self.spread_input_mode):
+            input_mode = "spread_book"
+        else:
+            input_mode = strategy_type if requires_single_input else "full"
+        return required_args, input_mode
+
 
     def _save_code(
         self,
@@ -216,30 +3112,56 @@ class ReflectionPipeline:
         success: bool,
         error: Optional[str],
         task_description: str,
-    ) -> str:
-        self._code_iteration += 1
-        return self._storage.save_code(
+        step: int,
+        attempt: int,
+    ) -> Tuple[str, Optional[int]]:
+        if success:
+            node_id = self._tree.next_node_id()
+            code_file = self._storage.save_code(
+                code=code,
+                function_name="agent_strategy",
+                iteration=node_id,
+                task_description=task_description,
+                error_feedback=error,
+                success=True,
+            )
+            return code_file, node_id
+
+        code_file = self._storage.save_failed_attempt(
             code=code,
             function_name="agent_strategy",
-            iteration=self._code_iteration,
+            step=step,
+            attempt=attempt,
             task_description=task_description,
             error_feedback=error,
-            success=success,
         )
+        return code_file, None
 
-    def generate_and_verify(self, *, batch_context: List[Dict[str, Any]]) -> GenerationResult:
-        parent = self._tree.select_ucb(
-            exploration=self.exploration_constant,
-            total_visits=self._total_visits,
-        )
+    def generate_and_verify(
+        self, *, step: int, step_index: Optional[int] = None
+    ) -> GenerationResult:
+        parent, select_mode = self._select_parent_node()
+        self._log_parent_selection(parent, select_mode=select_mode)
+        parent_type = parent.metadata.get("type", "full")
+        required_args, input_mode = self._strategy_type_params(parent_type)
+        escape_mode = self._should_plateau_escape(parent)
+        hypothesis_jump = False
         if self.fixed_strategy_code is not None:
             code = self.fixed_strategy_code
-            ok, err, fn = self._verifier.verify(code)
-            code_file = self._save_code(
+            ok, err, fn = self._verifier.verify(
+                code,
+                required_args=required_args,
+                input_mode=input_mode,
+                forbid_numpy_random=self.forbid_numpy_random,
+            spread_omit_fundamental=self.spread_omit_fundamental,
+            )
+            code_file, node_id = self._save_code(
                 code=code,
                 success=bool(ok),
                 error=err,
                 task_description="fixed strategy",
+                step=step,
+                attempt=1,
             )
             return GenerationResult(
                 code=code,
@@ -248,38 +3170,392 @@ class ReflectionPipeline:
                 success=bool(ok),
                 error=err,
                 code_file=code_file,
+                strategy_type=parent_type,
+                node_id=node_id,
+                escape_mode=False,
+                hypothesis_jump=False,
+                parent_select_mode=select_mode,
             )
 
-        code = self._generator.generate(
-            parent_code=parent.code,
-            parent_reflection=parent.reflection,
-            batch_context=batch_context,
-            strategy_output_mode=self.strategy_output_mode,
-            offline_example=self._offline_example,
-        )
+        parent_reflection = parent.reflection
+        extra_instructions: Optional[List[str]] = None
+        gen_temperature = 0.2
+        combination_mode = False
+        combination_source_codes: Optional[List[str]] = None
+        combination_source_family_ids: Optional[List[str]] = None
+        forced_pair = self._force_hypothesis_pair
+        if forced_pair is not None:
+            principle, form_class = forced_pair
+            escape_mode = False
+            hypothesis_jump = True
+            parent_fields = parse_principle_form_fields(parent.reflection or "")
+            parent_comp = None
+            if isinstance(getattr(parent, "performance", None), dict):
+                parent_comp = parent.performance.get("zi_benchmark_comparison")
+            shade_dir = infer_curriculum_shade_diagnosis(parent_comp)[
+                "shade_error_direction"
+            ]
+            parent_reflection = _forced_menu_pair_diagnosis(
+                principle=principle,
+                form_class=form_class,
+                strategy_type=str(parent_type or "pv"),
+                lob_input_mode=self.lob_input_mode,
+                spread_input_mode=self.spread_input_mode,
+                shade_error_direction=str(shade_dir),
+            )
+            extra_instructions = [
+                "MENU SWEEP: implement the forced hypothesis pair from Parent Reflection.",
+                f"REQUIRED principle={principle}, form_class={form_class}.",
+                f"REQUIRED shade_error_direction={shade_dir} "
+                "(level hypothesis realized via that menu pair).",
+                "Follow the Parent Reflection DIAGNOSIS — new structure/features/control "
+                "flow as needed for this pair, not only constants.",
+            ] + hypothesis_jump_generator_instructions(
+                parent_principle=parent_fields.get("principle"),
+                parent_form=parent_fields.get("form_class"),
+            )
+            gen_temperature = self.plateau_escape_temperature
+            print(
+                f"[reflection] menu-sweep forced pair "
+                f"principle={principle} form_class={form_class} "
+                f"(parent={parent.node_id})",
+                flush=True,
+            )
+        elif escape_mode:
+            print(
+                f"[reflection] plateau escape on parent {parent.node_id} "
+                f"(non_improve_streak="
+                f"{int(parent.metadata.get('non_improve_streak', 0))}/"
+                f"{self.plateau_non_improve_threshold}): revising hypothesis...",
+                flush=True,
+            )
+            parent_reflection = self._generate_plateau_revision(parent)
+            stalled = parse_principle_form_fields(parent.reflection or "")
+            extra_instructions = plateau_escape_generator_instructions(
+                stalled_principle=stalled.get("principle"),
+                stalled_form=stalled.get("form_class"),
+            )
+            gen_temperature = self.plateau_escape_temperature
+            parent.metadata["plateau_revision"] = parent_reflection
+            parent.metadata["last_escape_step"] = int(step)
 
+        action = parse_diagnosis_action(parent_reflection or "")
+        same_fail = parse_same_failure_as_last_hold(parent_reflection or "")
+        if action is None and same_fail == "yes":
+            action = "refine"
+        elif action is None and same_fail == "no":
+            action = "replace"
+        if action and extra_instructions is None:
+            parent_fields = parse_principle_form_fields(parent_reflection or "")
+            extra_instructions = diagnosis_action_generator_instructions(
+                action=action,
+                parent_principle=parent_fields.get("principle"),
+                parent_form=parent_fields.get("form_class"),
+            )
+
+        forbidden_strategies = _collect_forbidden_strategy_examples(parent, self._tree)
+
+        generator_batch_summary, generator_batch_data = (
+            self._parent_generator_context_for_generation(parent.node_id)
+        )
+        if (
+            step_index is not None
+            and self._is_resample_transfer_step(step_index)
+            and self.generator_include_critic_data
+        ):
+            generator_batch_data = self._attach_parent_transfer_cards(
+                parent=parent,
+                generator_batch_data=generator_batch_data,
+                strategy_type=parent_type,
+                step_index=step_index,
+            )
+
+        print("[reflection] calling LLM for strategy code...", flush=True)
+        code = ""
         last_error = None
         strategy_fn = None
         success = False
         code_file = None
+        node_id: Optional[int] = None
+        parent_performance = self._parent_performance_for_generation(parent.node_id)
+        sibling_code = None
+        sibling_context = None
+        from marketsim.LLM.reflection_pipeline.prompt_profile import (
+            slim_prompt_profile_active,
+        )
+
+        plan_guided_recovery = bool(parent_reflection) and (
+            (
+                self.codegen_recovery_mode == "plan_guided"
+                and is_structured_principle_form(self.critic_mode)
+            )
+            or (
+                slim_prompt_profile_active()
+                and is_structured_principle_form(self.critic_mode)
+            )
+            or (
+                self.learning_structural_recovery
+                and is_structured_principle_form(self.critic_mode)
+                and (
+                    bool(escape_mode)
+                    or bool(hypothesis_jump)
+                    or performance_zero_trade_regime(parent_performance)
+                    or (
+                        self.learning_falsify_shade_collapse
+                        and performance_shade_collapse_regime(parent_performance)
+                    )
+                )
+            )
+        )
+
+        def _debug_codegen(
+            *,
+            error: str,
+            current_code: str,
+            force_new_form: bool = False,
+            temperature: float = DUPLICATE_RECOVERY_TEMPERATURE,
+        ) -> Optional[str]:
+            last_dbg_error: Optional[str] = None
+            for debug_attempt in range(self.max_debug_retries):
+                try:
+                    return self._generator.debug(
+                        code=current_code,
+                        error=error,
+                        forbidden_strategies=forbidden_strategies or None,
+                        force_new_form=force_new_form,
+                        temperature=temperature,
+                        parent_reflection=(
+                            parent_reflection if plan_guided_recovery else None
+                        ),
+                        plan_guided_recovery=plan_guided_recovery,
+                        critic_mode=self.critic_mode,
+                        strategy_type=parent_type,
+                    )
+                except Exception as exc:
+                    last_dbg_error = str(exc)
+                    print(
+                        f"[reflection] debug codegen failed "
+                        f"(attempt {debug_attempt + 1}/{self.max_debug_retries}): "
+                        f"{last_dbg_error}",
+                        flush=True,
+                    )
+            print(
+                "[reflection] debug codegen exhausted retries; skipping step",
+                flush=True,
+            )
+            return None
+
+        def _generate_once(*, temperature: float = 0.2) -> str:
+            return self._generator.generate(
+                parent_code=parent.code,
+                parent_reflection=parent_reflection,
+                strategy_output_mode=self.strategy_output_mode,
+                offline_example=None,
+                strategy_type=parent_type,
+                use_reflection=self.critic_enabled or bool(parent_reflection),
+                parent_performance=parent_performance,
+                generator_batch_summary=generator_batch_summary,
+                generator_batch_data=generator_batch_data,
+                sibling_code=sibling_code,
+                sibling_context=sibling_context,
+                q_reward_mode=self.q_reward_mode,
+                critic_mode=self.critic_mode,
+                forbid_numpy_random=self.forbid_numpy_random,
+                extra_instructions=extra_instructions,
+                temperature=temperature,
+                lob_input_mode=self.lob_input_mode,
+                spread_input_mode=self.spread_input_mode,
+                learning_lessons=(
+                    self._learning_lessons.as_list()
+                    if self.learning_lesson_memory
+                    else None
+                ),
+                learning_falsify_zero_trade=self.learning_falsify_zero_trade,
+                learning_falsify_shade_collapse=self.learning_falsify_shade_collapse,
+                learning_lesson_memory=self.learning_lesson_memory,
+                outcome_first=self.learning_outcome_first,
+            )
+
+        for gen_attempt in range(self.max_debug_retries):
+            try:
+                code = _generate_once(temperature=gen_temperature)
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                print(
+                    f"[reflection] codegen failed (attempt {gen_attempt + 1}): {last_error}",
+                    flush=True,
+                )
+                if gen_attempt >= self.max_debug_retries - 1:
+                    code_file, node_id = self._save_code(
+                        code=code or "# code generation failed",
+                        success=False,
+                        error=last_error,
+                        task_description="reflection step codegen failed",
+                        step=step,
+                        attempt=gen_attempt + 1,
+                    )
+                    self._note_parent_codegen_outcome(parent.node_id, success=False)
+                    return GenerationResult(
+                        code=code,
+                        strategy_fn=None,
+                        parent_id=parent.node_id,
+                        success=False,
+                        error=last_error,
+                        code_file=code_file,
+                        strategy_type=parent_type,
+                        node_id=node_id,
+                        escape_mode=escape_mode,
+                        hypothesis_jump=hypothesis_jump,
+                        parent_select_mode=select_mode,
+                    )
 
         for attempt in range(self.max_debug_retries):
-            ok, err, fn = self._verifier.verify(code)
-            code_file = self._save_code(
+            try:
+                code = finalize_strategy_code(code, parent.code)
+            except ValueError as exc:
+                ok = False
+                err = str(exc)
+                fn = None
+                last_error = enrich_verify_error_hint(err)
+                print(
+                    f"[reflection] verify failed (attempt {attempt + 1}): {last_error}",
+                    flush=True,
+                )
+                code_file, node_id = self._save_code(
+                    code=code,
+                    success=False,
+                    error=last_error,
+                    task_description=f"reflection step attempt {attempt + 1}",
+                    step=step,
+                    attempt=attempt + 1,
+                )
+                if attempt < self.max_debug_retries - 1:
+                    print("[reflection] calling LLM debug...", flush=True)
+                    code = _debug_codegen(
+                        error=last_error,
+                        current_code=code,
+                        force_new_form=bool(escape_mode or hypothesis_jump),
+                    )
+                    if code is None:
+                        last_error = last_error or "debug codegen failed after retries"
+                        break
+                    continue
+                break
+
+            ok, err, fn = self._verifier.verify(
+                code,
+                required_args=required_args,
+                input_mode=input_mode,
+                forbid_numpy_random=self.forbid_numpy_random,
+                spread_omit_fundamental=self.spread_omit_fundamental,
+                parent_code=parent.code,
+            )
+            if err:
+                err = enrich_verify_error_hint(err)
+            code_file, node_id = self._save_code(
                 code=code,
                 success=bool(ok),
                 error=err,
                 task_description=f"reflection step attempt {attempt + 1}",
+                step=step,
+                attempt=attempt + 1,
             )
             if ok:
+                dup_error = _duplicate_strategy_rejection_message(
+                    code,
+                    parent=parent,
+                    tree=self._tree,
+                )
+                if dup_error:
+                    ok = False
+                    last_error = enrich_verify_error_hint(dup_error)
+                    print(
+                        f"[reflection] verify rejected (attempt {attempt + 1}): "
+                        f"{last_error}",
+                        flush=True,
+                    )
+                    if attempt < self.max_debug_retries - 1:
+                        recovery_label = (
+                            "plan-guided debug (implement Parent Reflection DIAGNOSIS)"
+                            if plan_guided_recovery
+                            else "local parent edit (sibling clones forbidden)"
+                        )
+                        print(
+                            f"[reflection] calling LLM debug for {recovery_label}...",
+                            flush=True,
+                        )
+                        code = _debug_codegen(
+                            error=last_error,
+                            current_code=code,
+                            force_new_form=bool(escape_mode or hypothesis_jump),
+                            temperature=(
+                                self.plateau_escape_temperature
+                                if escape_mode or hypothesis_jump
+                                else DUPLICATE_RECOVERY_TEMPERATURE
+                            ),
+                        )
+                        if code is None:
+                            last_error = last_error or "debug codegen failed after retries"
+                            break
+                        continue
+                diag_error = None
+                if plan_guided_recovery:
+                    diag_error = validate_code_implements_diagnosis(
+                        code,
+                        parent_reflection or "",
+                        strategy_type=str(parent_type or "pv"),
+                    )
+                if diag_error:
+                    ok = False
+                    last_error = diag_error
+                    print(
+                        f"[reflection] verify rejected (attempt {attempt + 1}): "
+                        f"{last_error}",
+                        flush=True,
+                    )
+                    if attempt < self.max_debug_retries - 1:
+                        print(
+                            "[reflection] calling LLM debug for plan-guided "
+                            "diagnosis implementation...",
+                            flush=True,
+                        )
+                        code = _debug_codegen(
+                            error=last_error,
+                            current_code=code,
+                            force_new_form=bool(escape_mode or hypothesis_jump),
+                            temperature=(
+                                self.plateau_escape_temperature
+                                if escape_mode or hypothesis_jump
+                                else DUPLICATE_RECOVERY_TEMPERATURE
+                            ),
+                        )
+                        if code is None:
+                            last_error = last_error or "debug codegen failed after retries"
+                            break
+                        continue
                 success = True
                 strategy_fn = fn
                 last_error = None
+                print(f"[reflection] verify OK (attempt {attempt + 1})", flush=True)
                 break
             last_error = err or "Verification failed"
+            print(
+                f"[reflection] verify failed (attempt {attempt + 1}): {last_error}",
+                flush=True,
+            )
             if attempt < self.max_debug_retries - 1:
-                code = self._generator.debug(code=code, error=last_error)
+                print("[reflection] calling LLM debug...", flush=True)
+                code = _debug_codegen(
+                    error=last_error,
+                    current_code=code,
+                    temperature=DUPLICATE_RECOVERY_TEMPERATURE,
+                )
+                if code is None:
+                    last_error = last_error or "debug codegen failed after retries"
+                    break
 
+        self._note_parent_codegen_outcome(parent.node_id, success=bool(success))
         return GenerationResult(
             code=code,
             strategy_fn=strategy_fn,
@@ -287,19 +3563,98 @@ class ReflectionPipeline:
             success=success,
             error=last_error,
             code_file=code_file,
+            strategy_type=parent_type,
+            node_id=node_id,
+            escape_mode=escape_mode,
+            hypothesis_jump=hypothesis_jump,
+            combination_mode=combination_mode,
+            parent_select_mode=select_mode,
+            combination_source_codes=combination_source_codes,
+            combination_source_family_ids=combination_source_family_ids,
         )
 
-    def _fallback_reflection(self, reward: float, batch_summary: Dict[str, Any]) -> str:
-        top_configs = batch_summary.get("per_config", {})
-        summary = ", ".join(
-            f"{k}={v:.3f}" for k, v in list(top_configs.items())[:3]
+    def _sibling_reflections_for_parent(self, parent_id: int) -> List[str]:
+        parent = self._tree.get(parent_id)
+        reflections: List[str] = []
+        for child_id in getattr(parent, "children", []) or []:
+            child = self._tree.get(child_id)
+            if child is not None and child.reflection:
+                reflections.append(str(child.reflection))
+        return reflections
+
+    def _maybe_record_learning_lesson(
+        self,
+        *,
+        step_label: str,
+        batch_summary: Optional[Dict[str, Any]],
+        reflection: str = "",
+        note: Optional[str] = None,
+    ) -> None:
+        if not self.learning_lesson_memory:
+            return
+        signals = learning_outcome_signals(batch_summary)
+        action = parse_diagnosis_action(reflection or "") if reflection else None
+        self._learning_lessons.append(
+            format_lesson_line(
+                step_label=step_label,
+                signals=signals,
+                action=action,
+                note=note,
+            )
         )
-        return "\n".join(
-            [
-                "Environment: mixed-market batch evaluation.",
-                f"Performance: reward={reward:.4f}; per_config={summary}",
-                "Fix: tighten shading when surplus lags, relax when ahead.",
-            ]
+
+    def _generate_reflection(
+        self,
+        *,
+        code: str,
+        reward: float,
+        reward_variance: float,
+        batch_summary: Dict[str, Any],
+        batch_data: Any,
+        batch_data_full: Optional[Dict[str, Any]] = None,
+        strategy_type: str = "pv",
+        parent_id: Optional[int] = None,
+    ) -> str:
+        if self._critic is None:
+            return ""
+        critic_batch_data = batch_data_full if batch_data_full is not None else batch_data
+        parent_reflection: Optional[str] = None
+        sibling_reflections: Optional[List[str]] = None
+        if parent_id is not None:
+            parent_node = self._tree.get(parent_id)
+            parent_reflection = getattr(parent_node, "reflection", "") or ""
+            sibling_reflections = self._sibling_reflections_for_parent(parent_id)
+        explored_pairs = (
+            self._run_explored_hypothesis_pairs(strategy_type)
+            if self.menu_exploration_enabled
+            else None
+        )
+        return self._critic.generate(
+            code=code,
+            batch_summary=batch_summary,
+            batch_data=critic_batch_data,
+            reward=reward,
+            reward_variance=reward_variance,
+            include_data=self.critic_include_data,
+            q_reward_mode=self.q_reward_mode,
+            critic_mode=self.critic_mode,
+            strategy_type=strategy_type,
+            parent_reflection=parent_reflection,
+            sibling_reflections=sibling_reflections,
+            run_explored_pairs=explored_pairs,
+            menu_exploration_enabled=self.menu_exploration_enabled,
+            lob_input_mode=self.lob_input_mode,
+            spread_input_mode=self.spread_input_mode,
+            learning_lessons=(
+                self._learning_lessons.as_list()
+                if self.learning_lesson_memory
+                else None
+            ),
+            learning_falsify_zero_trade=self.learning_falsify_zero_trade,
+            learning_falsify_shade_collapse=self.learning_falsify_shade_collapse,
+            learning_lesson_memory=self.learning_lesson_memory,
+            learning_force_menu_replace=self.learning_force_menu_replace,
+            learning_outcome_first=self.learning_outcome_first,
         )
 
     def reflect_and_update(
@@ -307,71 +3662,650 @@ class ReflectionPipeline:
         *,
         code: str,
         reward: float,
+        reward_variance: float,
         batch_summary: Dict[str, Any],
+        batch_data: Any,
+        batch_data_full: Optional[Dict[str, Any]] = None,
+        per_config_rewards: Optional[Dict[str, float]] = None,
+        per_config_reward_variances: Optional[Dict[str, float]] = None,
         parent_id: int,
+        escape_mode: bool = False,
+        hypothesis_jump: bool = False,
+        combination_mode: bool = False,
+        combination_source_family_ids: Optional[List[str]] = None,
     ) -> str:
-        if self._critic is not None:
-            reflection = self._critic.generate(code=code, batch_summary=batch_summary, reward=reward)
-        else:
-            reflection = self._fallback_reflection(reward, batch_summary)
+        parent_node = self._tree.get(parent_id)
+        parent_type = parent_node.metadata.get("type", "full")
+        reflection = ""
+        if self.critic_enabled:
+            reflection = self._generate_reflection(
+                code=code,
+                reward=reward,
+                reward_variance=reward_variance,
+                batch_summary=batch_summary,
+                batch_data=batch_data,
+                batch_data_full=batch_data_full,
+                strategy_type=str(parent_type or "pv"),
+                parent_id=parent_id,
+            )
 
-        self._tree.add_node(parent_id=parent_id, code=code, reflection=reflection, reward=reward)
-        self._tree.update_ancestors(start_node_id=parent_id, reward=reward)
+        parent_hypothesis = getattr(parent_node, "reflection", "") or ""
+        adherence = score_hypothesis_adherence(
+            code,
+            parent_hypothesis,
+            strategy_type=str(parent_type or "pv"),
+        )
+        child_metadata = {
+            "type": parent_type,
+            "escape_mode": bool(escape_mode),
+            "hypothesis_jump": bool(hypothesis_jump),
+            "hypothesis_adherence": adherence.to_dict(),
+        }
+        parent_desc = parent_node.metadata.get("desc")
+        if combination_mode:
+            child_metadata["combination_mode"] = True
+            if combination_source_family_ids:
+                child_metadata["source_family_ids"] = list(combination_source_family_ids)
+        if parent_desc:
+            child_metadata["desc"] = parent_desc
+
+        child = self._tree.add_node(
+            parent_id=parent_id,
+            code=code,
+            reflection=reflection,
+            reward=reward,
+            metadata=child_metadata,
+            q_update_mode=self.q_update_mode,
+        )
+        self._store_node_family_metadata(child.node_id, reflection=reflection, code=code)
+        overall = None
+        if batch_data_full is not None:
+            overall = summarize_batch_performance(
+                batch_data_full,
+                reward_mode=self.reward_mode,
+            )
+        performance_payload = _performance_payload(
+            reward=reward,
+            reward_variance=reward_variance,
+            per_config_rewards=per_config_rewards or {},
+            per_config_reward_variances=per_config_reward_variances or {},
+            overall=overall,
+            zi_benchmark_comparison=self._zi_comparison_from_batch(batch_data_full),
+            batch_data=batch_data_full if isinstance(batch_data_full, dict) else None,
+            reward_mode=self.reward_mode,
+        )
+        self._store_node_performance(child.node_id, performance_payload)
+        self._store_node_generator_context(
+            child.node_id,
+            reward=reward,
+            reward_variance=reward_variance,
+            per_config_rewards=per_config_rewards or {},
+            per_config_reward_variances=per_config_reward_variances or {},
+            batch_data=batch_data_full,
+        )
+        self._apply_zi_node_eval(
+            child.node_id,
+            comparison=performance_payload.get("zi_benchmark_comparison"),
+        )
+        self._store_creation_metrics(
+            child.node_id,
+            batch_data=batch_data_full if isinstance(batch_data_full, dict) else None,
+            comparison=performance_payload.get("zi_benchmark_comparison"),
+            reward=float(reward),
+        )
+        self._note_parent_refine_outcome(
+            parent_id,
+            child_id=child.node_id,
+            escape_mode=bool(escape_mode),
+        )
+        print(
+            f"[reflection] child {child.node_id}: hypothesis adherence "
+            f"overall={adherence.overall:.3f} "
+            f"(principle_ok={adherence.principle_ok}, form_ok={adherence.form_class_ok}, "
+            f"features={adherence.feature_coverage:.3f})",
+            flush=True,
+        )
+        if adherence.violation:
+            print(
+                f"[reflection] child {child.node_id}: adherence note: {adherence.violation}",
+                flush=True,
+            )
+        self._maybe_record_learning_lesson(
+            step_label=f"node {child.node_id}",
+            batch_summary=batch_summary,
+            reflection=reflection,
+        )
+        self._maybe_mark_inactive(child.node_id)
         self._total_visits += 1
         return reflection
 
-    def run(self) -> Dict[str, Any]:
-        batch_configs = self._select_batch()
-        summary: List[Dict[str, Any]] = []
-
-        for step_index in range(self.steps):
-            batch_context = [cfg.observable_state() for cfg in batch_configs]
-            gen = self.generate_and_verify(batch_context=batch_context)
-            if not gen.success or gen.strategy_fn is None:
-                summary.append(
-                    {
-                        "step": step_index + 1,
-                        "success": False,
-                        "error": gen.error,
-                        "parent_id": gen.parent_id,
-                        "code_file": gen.code_file,
-                    }
+    def _run_refinement_step(
+        self,
+        *,
+        step_display: int,
+        steps_total: int,
+        step_index: int,
+        codegen_step: int,
+        phase: str,
+        train_configs: List[ReflectionMarketConfig],
+        q_suite_configs: List[ReflectionMarketConfig],
+        block_idx: Optional[int] = None,
+        sweep_market_index: Optional[int] = None,
+        forced_pair: Optional[Tuple[str, str]] = None,
+        forced_parent_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        batch_configs = train_configs
+        header_bits = [
+            f"\n[reflection] === {phase} step {step_display}/{steps_total} === "
+            f"batch={[cfg.label for cfg in batch_configs]}"
+        ]
+        if phase == "menu_sweep":
+            header_bits.append(
+                f" sweep_mkt={sweep_market_index} "
+                f"q_suite={[cfg.label for cfg in q_suite_configs]}"
+            )
+            if forced_pair is not None:
+                header_bits.append(
+                    f" force_pair={forced_pair[0]}+{forced_pair[1]}"
                 )
-                continue
+        elif phase == "homeset_menu_sweep":
+            header_bits.append(
+                f" home_set={[cfg.label for cfg in train_configs]}"
+            )
+            if forced_pair is not None:
+                header_bits.append(
+                    f" force_pair={forced_pair[0]}+{forced_pair[1]}"
+                )
+            if forced_parent_id is not None:
+                header_bits.append(f" force_parent={int(forced_parent_id)}")
+        elif self.market_block_size > 0:
+            header_bits.append(
+                f" block={block_idx} q_suite={[cfg.label for cfg in q_suite_configs]}"
+            )
+        elif self.home_set_size > 0 and self.resample_every <= 0:
+            header_bits.append(
+                f" home_set={[cfg.label for cfg in train_configs]}"
+            )
+        elif self.resample_every > 0:
+            header_bits.append(
+                f" resample_slot={self._resample_slot_index(step_index)} "
+                f"hold={[cfg.label for cfg in train_configs]}"
+            )
+            if self._is_resample_transfer_step(step_index):
+                prev = self._previous_resample_slot()
+                header_bits.append(
+                    f" transfer_test last="
+                    f"{[cfg.label for cfg in prev] if prev is not None else '?'}"
+                )
+        print("".join(header_bits), flush=True)
 
-            eval_result = evaluate_batch(
+        step_suite: Optional[FixedEvalSuite] = None
+        q_suite: Optional[FixedEvalSuite] = None
+        if self.q_eval_mode == "full_refresh":
+            step_suite = self._build_step_eval_suite(train_configs, step_index=step_index)
+            train_labels = [cfg.label for cfg in train_configs]
+            q_labels = [cfg.label for cfg in q_suite_configs]
+            q_suite = (
+                step_suite
+                if train_labels == q_labels
+                else self._build_step_eval_suite(
+                    q_suite_configs, step_index=step_index + 10_000
+                )
+            )
+            print(
+                f"[reflection] step {step_display} train suite {step_suite.suite_id} "
+                f"(creation/critic); Q suite {q_suite.suite_id} "
+                f"({len(q_suite_configs)} market(s))",
+                flush=True,
+            )
+
+        self._force_hypothesis_pair = forced_pair
+        self._force_parent_id = (
+            int(forced_parent_id) if forced_parent_id is not None else None
+        )
+        self._force_train_configs = list(train_configs)
+        self._force_q_configs = list(q_suite_configs)
+        try:
+            gen = self.generate_and_verify(step=codegen_step, step_index=step_index)
+        finally:
+            self._clear_step_force_overrides()
+
+        if not gen.success or gen.strategy_fn is None:
+            print(
+                f"[reflection] step {step_display}: codegen/verify FAILED "
+                f"(parent={gen.parent_id}, type={gen.strategy_type}): {gen.error}",
+                flush=True,
+            )
+            return {
+                "step": step_display,
+                "phase": phase,
+                "success": False,
+                "error": gen.error,
+                "parent_id": gen.parent_id,
+                "code_file": gen.code_file,
+                "sweep_market_index": sweep_market_index,
+                "forced_parent_id": (
+                    int(forced_parent_id) if forced_parent_id is not None else None
+                ),
+                "forced_pair": (
+                    {"principle": forced_pair[0], "form_class": forced_pair[1]}
+                    if forced_pair
+                    else None
+                ),
+            }
+
+        print(
+            f"[reflection] step {step_display}: strategy OK "
+            f"(parent={gen.parent_id}, type={gen.strategy_type}, code={gen.code_file})",
+            flush=True,
+        )
+        print(f"[reflection] step {step_display}: evaluating batch...", flush=True)
+        if self.q_eval_mode == "full_refresh":
+            eval_result = self._evaluate_on_suite(
+                strategy_fn=gen.strategy_fn,
+                suite=step_suite,
+                strategy_type=gen.strategy_type,
+                include_batch_data=True,
+                strategy_code=gen.code,
+            )
+        else:
+            eval_result = self._evaluate_strategy_batch(
                 strategy_fn=gen.strategy_fn,
                 batch_configs=batch_configs,
-                episodes_per_config=self.episodes_per_config,
                 step_index=step_index,
-                base_seed=self.seed,
-                reward_mode=self.reward_mode,
-                max_events_per_episode=40,
-                strategy_output_mode=self.strategy_output_mode,
+                strategy_type=gen.strategy_type,
+                include_batch_data=True,
+                strategy_code=gen.code,
             )
-            batch_summary = {
-                "per_config": eval_result.per_config_rewards,
-                "reward": eval_result.reward,
-            }
-            reflection = self.reflect_and_update(
-                code=gen.code,
-                reward=eval_result.reward,
-                batch_summary=batch_summary,
-                parent_id=gen.parent_id,
+        if (
+            self._is_resample_transfer_step(step_index)
+            and gen.strategy_fn is not None
+            and isinstance(eval_result.batch_data, dict)
+        ):
+            prior_card = self._second_test_prior_hold_card(
+                strategy_fn=gen.strategy_fn,
+                strategy_type=gen.strategy_type,
+                step_index=step_index,
+            )
+            if prior_card:
+                eval_result.batch_data = _attach_prior_hold_card(
+                    eval_result.batch_data, prior_card
+                )
+        batch_summary, compressed_data = _critic_prompt_inputs(
+            self,
+            reward=eval_result.reward,
+            reward_variance=eval_result.reward_variance,
+            per_config_rewards=eval_result.per_config_rewards,
+            per_config_reward_variances=eval_result.per_config_reward_variances,
+            batch_data=eval_result.batch_data,
+        )
+        print(
+            f"[reflection] step {step_display}: "
+            f"{self._format_step_eval_reward(eval_result)} "
+            f"per_config={eval_result.per_config_rewards}",
+            flush=True,
+        )
+        if self.critic_enabled:
+            print(
+                f"[reflection] step {step_display}: generating critic reflection...",
+                flush=True,
+            )
+        else:
+            print(
+                f"[reflection] step {step_display}: recording metrics (no reflection)...",
+                flush=True,
+            )
+        reflection = self.reflect_and_update(
+            code=gen.code,
+            reward=eval_result.reward,
+            reward_variance=eval_result.reward_variance,
+            batch_summary=batch_summary,
+            batch_data=compressed_data,
+            batch_data_full=eval_result.batch_data,
+            per_config_rewards=eval_result.per_config_rewards,
+            per_config_reward_variances=eval_result.per_config_reward_variances,
+            parent_id=gen.parent_id,
+            escape_mode=bool(gen.escape_mode),
+            hypothesis_jump=bool(gen.hypothesis_jump),
+            combination_mode=bool(gen.combination_mode),
+            combination_source_family_ids=gen.combination_source_family_ids,
+        )
+
+        step_payload: Dict[str, Any] = {
+            "step": step_display,
+            "phase": phase,
+            "success": True,
+            "parent_id": gen.parent_id,
+            "node_id": gen.node_id,
+            "escape_mode": bool(gen.escape_mode),
+            "hypothesis_jump": bool(gen.hypothesis_jump),
+            "combination_mode": bool(gen.combination_mode),
+            "parent_select_mode": gen.parent_select_mode,
+            "reward": eval_result.reward,
+            "reward_variance": eval_result.reward_variance,
+            "per_config_rewards": eval_result.per_config_rewards,
+            "per_config_reward_variances": eval_result.per_config_reward_variances,
+            "performance": summarize_batch_performance(
+                eval_result.batch_data,
+                reward_mode=self.reward_mode,
+            ),
+            "reflection": reflection,
+            "code_file": gen.code_file,
+            "batch_configs": [cfg.observable_state() for cfg in batch_configs],
+            "q_suite_configs": [cfg.observable_state() for cfg in q_suite_configs],
+            "market_block_index": block_idx,
+            "sweep_market_index": sweep_market_index,
+            "forced_parent_id": (
+                int(forced_parent_id) if forced_parent_id is not None else None
+            ),
+            "forced_pair": (
+                {"principle": forced_pair[0], "form_class": forced_pair[1]}
+                if forced_pair
+                else None
+            ),
+            "batch_data": eval_result.batch_data,
+        }
+        if eval_result.scalar_reward is not None:
+            step_payload["scalar_reward"] = eval_result.scalar_reward
+        if eval_result.zi_benchmark_comparison is not None:
+            step_payload["zi_benchmark_comparison"] = eval_result.zi_benchmark_comparison
+
+        if self.q_eval_mode == "full_refresh":
+            refresh_started = time.perf_counter()
+            refresh_results = self._refresh_all_nodes(
+                suite=q_suite if q_suite is not None else step_suite,
+                include_batch_data=False,
+            )
+            refresh_seconds = time.perf_counter() - refresh_started
+            refresh_entry = self._make_q_refresh_entry(
+                step=codegen_step,
+                phase=phase,
+                refresh_results=refresh_results,
+                refresh_seconds=refresh_seconds,
+                new_node_id=self._tree.evaluable_node_ids()[-1],
+                eval_suite=q_suite if q_suite is not None else step_suite,
+            )
+            self._q_refresh_history.append(refresh_entry)
+            step_payload["q_refresh"] = refresh_entry
+            new_node_id = refresh_entry["new_node_id"]
+            refreshed_node = self._tree.get(new_node_id)
+            step_payload["reward"] = float(refreshed_node.q_value)
+            step_payload["reward_variance"] = float(
+                refresh_entry.get("q_variances", {}).get(str(new_node_id), 0.0)
+            )
+            print(
+                f"[reflection] step {step_display}: refreshed Q for all nodes; "
+                f"new node {new_node_id} "
+                f"{_format_reward_stats(step_payload['reward'], step_payload['reward_variance'])}",
+                flush=True,
             )
 
-            summary.append(
-                {
-                    "step": step_index + 1,
-                    "success": True,
-                    "parent_id": gen.parent_id,
-                    "reward": eval_result.reward,
-                    "per_config_rewards": eval_result.per_config_rewards,
-                    "reflection": reflection,
-                    "code_file": gen.code_file,
-                    "batch_data": eval_result.batch_data,
-                }
+        if self.critic_enabled and reflection:
+            print(
+                f"[reflection] step {step_display}: reflection saved "
+                f"(preview: {_reflection_preview(reflection)}...)",
+                flush=True,
             )
+        else:
+            print(
+                f"[reflection] step {step_display}: node added with performance metrics only",
+                flush=True,
+            )
+        return step_payload
+
+    def _active_strategy_type_for_sweep(self) -> str:
+        strategy_type = "spread"
+        active_types = {
+            str(self._tree.get(nid).metadata.get("type", "pv"))
+            for nid in self._tree.active_node_ids()
+        }
+        if len(active_types) == 1:
+            strategy_type = next(iter(active_types))
+        elif "spread" in active_types:
+            strategy_type = "spread"
+        elif "lob" in active_types:
+            strategy_type = "lob"
+        elif "pv" in active_types:
+            strategy_type = "pv"
+        return strategy_type
+
+    def _run_homeset_menu_sweep(
+        self, *, codegen_step_start: int
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        if not self.menu_sweep_on_home_set:
+            return [], codegen_step_start
+        if not self._home_set:
+            raise RuntimeError("homeset menu sweep requires a sampled home set")
+
+        strategy_type = self._active_strategy_type_for_sweep()
+        pairs = self._menu_sweep_pairs(strategy_type)
+        home = list(self._home_set)
+        seed_parent = self._seed_node_for_strategy_type(strategy_type)
+        seed_parent_id = int(seed_parent.node_id)
+        total_steps = len(pairs)
+        print(
+            f"[reflection] homeset menu sweep: markets={len(home)} "
+            f"pairs={len(pairs)} total_steps={total_steps} "
+            f"strategy_type={strategy_type} "
+            f"force_parent=seed:{seed_parent_id} "
+            f"parallel_episodes={self.parallel_episodes} "
+            f"pair_order={[f'{p}+{f}' for p, f in pairs]}",
+            flush=True,
+        )
+        summary: List[Dict[str, Any]] = []
+        codegen_step = codegen_step_start
+        for display, pair in enumerate(pairs, start=1):
+            codegen_step += 1
+            step_index = 5_000 + display - 1
+            payload = self._run_refinement_step(
+                step_display=display,
+                steps_total=total_steps,
+                step_index=step_index,
+                codegen_step=codegen_step,
+                phase="homeset_menu_sweep",
+                train_configs=home,
+                q_suite_configs=home,
+                forced_pair=pair,
+                forced_parent_id=seed_parent_id,
+            )
+            summary.append(payload)
+
+        if self.resample_every > 0 and not self._resample_slots:
+            self._resample_slots = [list(home)]
+            self._resample_needs_q_realign = False
+            print(
+                "[reflection] seeded resample slot 0 from homeset menu sweep "
+                f"{[cfg.label for cfg in home]}",
+                flush=True,
+            )
+
+        print(
+            f"[reflection] homeset menu sweep complete "
+            f"({len(home)} markets, {total_steps} pairs); "
+            f"starting main phase for {self.steps} steps "
+            f"(parent_select={self._resolved_parent_selection_mode()}, "
+            f"resample_every={self.resample_every})",
+            flush=True,
+        )
+        return summary, codegen_step
+
+    def _run_menu_sweep(self, *, codegen_step_start: int) -> Tuple[List[Dict[str, Any]], int]:
+        if self.menu_sweep_on_home_set:
+            return self._run_homeset_menu_sweep(codegen_step_start=codegen_step_start)
+        if self.menu_sweep_markets <= 0:
+            return [], codegen_step_start
+        if self._config_space is None:
+            raise RuntimeError("menu sweep requires config_space")
+
+        strategy_type = self._active_strategy_type_for_sweep()
+
+        pairs = self._menu_sweep_pairs(strategy_type)
+        total_steps = self.menu_sweep_markets * len(pairs)
+        print(
+            f"[reflection] menu sweep: markets={self.menu_sweep_markets} "
+            f"pairs={len(pairs)} total_steps={total_steps} "
+            f"strategy_type={strategy_type} "
+            f"pair_order={[f'{p}+{f}' for p, f in pairs]}",
+            flush=True,
+        )
+        summary: List[Dict[str, Any]] = []
+        codegen_step = codegen_step_start
+        display = 0
+        for market_i in range(self.menu_sweep_markets):
+            market = self._config_space.sample(
+                self._rng, batch_index=1000 + market_i
+            )
+            self._sweep_markets.append(market)
+            print(
+                f"[reflection] menu sweep market {market_i}: train={market.label}",
+                flush=True,
+            )
+            q_suite_configs = self._sweep_markets[-self.q_suite_size :]
+            for pair in pairs:
+                display += 1
+                codegen_step += 1
+                step_index = 5_000 + display - 1
+                payload = self._run_refinement_step(
+                    step_display=display,
+                    steps_total=total_steps,
+                    step_index=step_index,
+                    codegen_step=codegen_step,
+                    phase="menu_sweep",
+                    train_configs=[market],
+                    q_suite_configs=list(q_suite_configs),
+                    block_idx=None,
+                    sweep_market_index=market_i,
+                    forced_pair=pair,
+                )
+                summary.append(payload)
+        print(
+            f"[reflection] menu sweep complete "
+            f"({len(self._sweep_markets)} markets, {display} steps); "
+            f"starting block/refinement phase for {self.steps} steps",
+            flush=True,
+        )
+        return summary, codegen_step
+
+    def run(self) -> Dict[str, Any]:
+        summary: List[Dict[str, Any]] = []
+        print(
+            f"[reflection] run_dir={Path(self.output_path).parent} "
+            f"steps={self.steps} batch_size={self.batch_size} "
+            f"episodes_per_config={self.episodes_per_config} critic={self.critic_enabled} "
+            f"critic_data={self.critic_include_data} "
+            f"generator_critic_data={self.generator_include_critic_data} "
+            f"generator_sibling={self.generator_include_sibling} "
+            f"q_eval_mode={self.q_eval_mode} q_update_mode={self.q_update_mode} "
+            f"q_reward_mode={self.q_reward_mode} critic_mode={self.critic_mode} "
+            f"parent_select={self._resolved_parent_selection_mode()} "
+            f"plateau_escape={self.plateau_escape_enabled} "
+            f"plateau_escape_mode={self.plateau_escape_mode} "
+            f"elite_bias={self.elite_parent_bias_prob:.2f} "
+            f"hypothesis_jump={self.hypothesis_jump_prob:.2f}"
+            + (f" recipe={self.recipe_id}" if self.recipe_id else "")
+            + (
+                f" menu_preset={self.principle_menu_preset}"
+                if self.principle_menu_preset
+                else ""
+            )
+            + f" menu_explore={self.menu_exploration_enabled}"
+            + f" codegen_recovery={self.codegen_recovery_mode}"
+            + f" lob_input_mode={self.lob_input_mode}"
+            + f" spread_input_mode={self.spread_input_mode} spread_omit_fundamental={self.spread_omit_fundamental}"
+            + f" background_agent_kind={self.background_agent_kind}"
+            + (
+                f" background_zip_fixed_mu={self.background_zip_fixed_mu:g}"
+                if self.background_zip_fixed_mu is not None
+                else ""
+            )
+            + (
+                f" background_zip_initial_mu={self.background_zip_initial_mu:g}"
+                if self.background_zip_initial_mu is not None
+                else ""
+            )
+            + (
+                f" background_zip_zi_warmup_steps={self.background_zip_zi_warmup_steps}"
+                if str(self.background_agent_kind).startswith("zip")
+                else ""
+            )
+            + f" market_block_size={self.market_block_size}"
+            + f" q_suite_size={self.q_suite_size}"
+            + f" menu_sweep_markets={self.menu_sweep_markets}"
+            + f" menu_sweep_on_home_set={self.menu_sweep_on_home_set}"
+            + f" home_set_size={self.home_set_size}"
+            + f" resample_every={self.resample_every}"
+            + f" model={self.model_name}",
+            flush=True,
+        )
+
+        if self.menu_sweep_on_home_set:
+            seed_train = list(self._home_set)
+            seed_q = seed_train
+            seed_batch = seed_train
+        elif self.menu_sweep_markets > 0 and self._config_space is not None:
+            seed_cfg = self._config_space.sample(self._rng, batch_index=-1)
+            seed_train = [seed_cfg]
+            seed_q = seed_train
+            seed_batch = seed_train
+        elif self.q_eval_mode == "full_refresh":
+            seed_train, seed_q = self._train_and_q_configs(step_index=0)
+            seed_batch = seed_train
+        else:
+            seed_train, _seed_q = self._train_and_q_configs(step_index=0)
+            seed_batch = seed_train
+            seed_q = seed_train
+
+        if self.q_eval_mode == "full_refresh":
+            print(
+                f"[reflection] seed-eval batch: {[cfg.label for cfg in seed_batch]}"
+                + (
+                    f" q_suite={[cfg.label for cfg in seed_q]}"
+                    if self.market_block_size > 0
+                    or self.menu_sweep_markets > 0
+                    or self.menu_sweep_on_home_set
+                    or self.home_set_size > 0
+                    or self.resample_every > 0
+                    else ""
+                ),
+                flush=True,
+            )
+            seed_suite = self._build_step_eval_suite(seed_q, step_index=-1)
+            print(
+                f"[reflection] seed eval suite {seed_suite.suite_id} "
+                f"(shared seeds for all seed nodes)",
+                flush=True,
+            )
+            seed_evaluations, seed_refresh_entry = self._evaluate_seed_nodes_full_refresh(
+                seed_suite
+            )
+            self._q_refresh_history.append(seed_refresh_entry)
+            seed_eval_suite = seed_suite.to_dict()
+        else:
+            raise RuntimeError("seed evaluation requires q_eval_mode=full_refresh")
+
+        sweep_summary, codegen_step = self._run_menu_sweep(codegen_step_start=0)
+        summary.extend(sweep_summary)
+
+        for step_index in range(self.steps):
+            train_configs, q_suite_configs = self._train_and_q_configs(step_index)
+            self._maybe_realign_q_for_resample(
+                step_index=step_index,
+                q_suite_configs=q_suite_configs,
+            )
+            block_idx = None
+            phase = "resample" if self.resample_every > 0 else "step"
+            codegen_step += 1
+            step_payload = self._run_refinement_step(
+                step_display=step_index + 1,
+                steps_total=self.steps,
+                step_index=step_index,
+                codegen_step=codegen_step,
+                phase=phase,
+                train_configs=train_configs,
+                q_suite_configs=q_suite_configs,
+                block_idx=block_idx,
+            )
+            summary.append(step_payload)
 
         payload = {
             "params": {
@@ -383,19 +4317,123 @@ class ReflectionPipeline:
                 "seed": self.seed,
                 "strategy_output_mode": self.strategy_output_mode,
                 "reward_mode": self.reward_mode,
+                "suite_aggregate": self.suite_aggregate,
+                "suite_aggregate_lambda": self.suite_aggregate_lambda,
+                "critic_enabled": self.critic_enabled,
+                "critic_include_data": self.critic_include_data,
+                "critic_per_config_metrics": self.critic_per_config_metrics,
+                "generator_include_critic_data": self.generator_include_critic_data,
+                "generator_include_sibling": self.generator_include_sibling,
+                "q_eval_mode": self.q_eval_mode,
+                "q_update_mode": self.q_update_mode,
+                "q_reward_mode": self.q_reward_mode,
+                "parent_selection_mode": self.parent_selection_mode,
+                "resolved_parent_selection_mode": self._resolved_parent_selection_mode(),
+                "recipe_id": self.recipe_id,
+                "inactive_gate_enabled": self.inactive_gate_enabled,
+                "inactive_gate_min_nodes": self.inactive_gate_min_nodes,
+                "inactive_surplus_gap": self.inactive_surplus_gap,
+                "inactive_beat_gap": self.inactive_beat_gap,
+                "critic_mode": self.critic_mode,
+                "zi_benchmark_shade_ranges": self.zi_benchmark_shade_ranges,
+                "forbid_numpy_random": self.forbid_numpy_random,
+                "parent_codegen_fail_cool_threshold": self.parent_codegen_fail_cool_threshold,
+                "plateau_escape_enabled": self.plateau_escape_enabled,
+                "plateau_non_improve_threshold": self.plateau_non_improve_threshold,
+                "plateau_improve_surplus_eps": self.plateau_improve_surplus_eps,
+                "plateau_improve_adv_eps": self.plateau_improve_adv_eps,
+                "elite_parent_bias_prob": self.elite_parent_bias_prob,
+                "hypothesis_jump_prob": self.hypothesis_jump_prob,
+                "plateau_escape_temperature": self.plateau_escape_temperature,
+                "plateau_escape_mode": self.plateau_escape_mode,
+                "principle_menu_preset": self.principle_menu_preset,
+                "menu_exploration_enabled": self.menu_exploration_enabled,
+                "codegen_recovery_mode": self.codegen_recovery_mode,
+                "prompt_profile": getattr(self, "prompt_profile", "standard"),
+                "lob_input_mode": self.lob_input_mode,
+                "spread_input_mode": self.spread_input_mode,
+                "spread_omit_fundamental": self.spread_omit_fundamental,
+                "background_agent_kind": self.background_agent_kind,
+                "background_zip_fixed_mu": self.background_zip_fixed_mu,
+                "background_zip_initial_mu": self.background_zip_initial_mu,
+                "background_zip_zi_warmup_steps": self.background_zip_zi_warmup_steps,
+                "parallel_episodes": self.parallel_episodes,
+                "parallel_episode_workers": self.parallel_episode_workers,
+                "skip_zi_benchmarks": self.skip_zi_benchmarks,
+                "q_refresh_top_k": self.q_refresh_top_k,
+                "q_refresh_always_recent": self.q_refresh_always_recent,
+                "q_refresh_episode_workers": self.q_refresh_episode_workers,
+                "lob_seed_scale": self.lob_seed_scale,
+                "learning_falsify_zero_trade": self.learning_falsify_zero_trade,
+                "learning_falsify_shade_collapse": self.learning_falsify_shade_collapse,
+                "learning_reject_noop_edits": self.learning_reject_noop_edits,
+                "learning_parent_max_children": self.learning_parent_max_children,
+                "learning_lesson_memory": self.learning_lesson_memory,
+                "learning_structural_recovery": self.learning_structural_recovery,
+                "learning_force_menu_replace": self.learning_force_menu_replace,
+                "learning_outcome_first": self.learning_outcome_first,
+                "model_name": self.model_name,
+                "market_block_size": self.market_block_size,
+                "q_suite_size": self.q_suite_size,
+                "menu_sweep_markets": self.menu_sweep_markets,
+                "menu_sweep_on_home_set": self.menu_sweep_on_home_set,
+                "home_set_size": self.home_set_size,
+                "home_set": [cfg.observable_state() for cfg in self._home_set],
+                "resample_every": self.resample_every,
+                "resample_markets": [
+                    cfg.observable_state() for cfg in self._resample_markets
+                ],
+                "resample_slots": [
+                    [cfg.observable_state() for cfg in slot]
+                    for slot in self._resample_slots
+                ],
+                "sweep_markets": [
+                    cfg.observable_state() for cfg in self._sweep_markets
+                ],
+                "block_markets": [
+                    cfg.observable_state() for cfg in self._block_markets
+                ],
+                "full_refresh_parallel_workers": FULL_REFRESH_PARALLEL_WORKERS,
+                "config_space": (
+                    self._config_space.to_dict()
+                    if self._config_space is not None
+                    else None
+                ),
+                "fixed_config_pool": (
+                    [cfg.observable_state() for cfg in self._config_pool]
+                    if self._config_pool is not None
+                    else None
+                ),
             },
             "run_dir": str(Path(self.output_path).parent),
-            "batch_configs": [cfg.observable_state() for cfg in batch_configs],
+            "seed_eval_batch": [cfg.observable_state() for cfg in seed_batch],
+            "seed_evaluations": seed_evaluations,
+            "seed_eval_suite": seed_eval_suite,
+            "q_refresh_history": self._q_refresh_history,
             "summary": summary,
             "tree": self._tree.to_dict(),
+            "learning_lessons": (
+                self._learning_lessons.as_list()
+                if self.learning_lesson_memory
+                else []
+            ),
         }
+        menu_coverage = self._menu_coverage_summary()
+        if menu_coverage:
+            payload["menu_coverage"] = menu_coverage
 
         out_path = Path(self.output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if menu_coverage:
+            for strategy_type, stats in menu_coverage.items():
+                print(
+                    f"[reflection] menu coverage ({strategy_type}): "
+                    f"{stats['explored_pair_count']}/{stats['menu_size']} pairs "
+                    f"({100.0 * stats['coverage_fraction']:.1f}%), "
+                    f"principle_entropy_norm={stats['principle_entropy_normalized']:.3f}, "
+                    f"complete={stats['exploration_complete']}",
+                    flush=True,
+                )
+        print(f"\n[reflection] done — summary written to {out_path}", flush=True)
         return payload
-
-
-def run_reflection_pipeline(**kwargs: Any) -> Dict[str, Any]:
-    pipeline = ReflectionPipeline(**kwargs)
-    return pipeline.run()
