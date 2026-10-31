@@ -8,10 +8,6 @@ import numpy as np
 
 
 class FourHeap:
-    """
-    This class reimplements the four-heap data structure described in "Flexible double auctions for electronic commerce:
-    theory and implementation" (Wurman, 98)
-    """
     def __init__(self, plus_one=False):
         self.plus_one = plus_one
 
@@ -152,7 +148,6 @@ class FourHeap:
                     b_quantity = b.quantity
 
     def withdraw_all(self, agent_id: int):
-        # Check if agent has any orders before trying to remove them
         if agent_id in self.agent_id_map and self.agent_id_map[agent_id]:
             for order_id in self.agent_id_map[agent_id]:
                 self.remove(order_id)
@@ -192,15 +187,3 @@ class FourHeap:
             self.midprices.append((best_ask + best_bid) / 2)
 
 
-
-    def observe(self) -> str:
-        s = '--------------\n'
-        names = ['buy_matched', 'buy_unmatched', 'sell_matched', 'sell_unmatched']
-        for i, heap in enumerate(self.heaps):
-            s += names[i]
-            s += '\n'
-            # s += f'Top order_id: {heap.peek_order().order_id}\n'
-            s += f'Top price: {abs(heap.peek())}\n'
-            s += f'Number of orders: {heap.count()}\n\n\n'
-
-        return s

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Order:
     price: float
-    order_type: int  # -1 for a sell order, +1 for a buy order
+    order_type: int
     quantity: float
     agent_id: int
     time: int
@@ -29,21 +29,7 @@ class Order:
         self.update_quantity_filled(self.quantity - transact_quantity)
         return new_order
 
-    def __eq__(self, other: 'Order') -> bool:
-        if other is None:
-            return False
-        return self.order_id == other.order_id
 
-    def __gt__(self, other: 'Order') -> bool:
-        if self.order_type == -1 and other.order_type == -1:
-            return (self.price, self.time) < (other.price, other.time)
-        elif self.order_type == 1 and other.order_type == 1:
-            return (self.price, -self.time) > (other.price, -other.time)
-        # I don't think these are needed
-        elif self.order_type == -1:
-            return self.price < other.price
-        elif self.order_type == 1:
-            return self.price > other.price
 
 
 @dataclass

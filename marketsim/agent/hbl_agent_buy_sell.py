@@ -1,9 +1,3 @@
-"""
-HBL Buy/Sell Agents - Split version of HBL agent for buying and selling only.
-Uses SeparatedPrivateValues with relative pricing (base_price=0).
-Directly adapted from hbl_agent.py for BUY and SELL-only operations.
-"""
-
 import random
 import sys
 import scipy as sp
@@ -13,37 +7,64 @@ from marketsim.market.market import Market
 from marketsim.fourheap.order import Order
 from marketsim.private_values.separated_private_values import SeparatedPrivateValues
 from marketsim.fourheap.constants import BUY, SELL
-from typing import List
+from typing import List, Union, Tuple
 from fastcubicspline import FCS
+
+from marketsim.agent.fundamental_estimate import absolute_fundamental_estimate
+from marketsim.agent.shading import (
+    maybe_take_best_quote_buy,
+    maybe_take_best_quote_sell,
+    zi_limit_price_buy,
+    zi_limit_price_sell,
+)
+from marketsim.LLM.hbl_order_memory import (
+    hbl_memory_start_time,
+    hbl_order_memory_partition,
+)
 
 
 class HBLAgentBuy(Agent):
-    """HBL Agent that only submits buy orders. Adapted from HBLAgent."""
-    
-    def __init__(self, agent_id: int, market: Market, q_max: int, shade: List, L: int, 
-                 pv_var: float, arrival_rate: float, obs_noise_var: float = 0.0, debug: bool = False):
+    def __init__(
+        self,
+        agent_id: int,
+        market: Market,
+        q_max: int,
+        shade: Union[List, List[Tuple]],
+        L: int,
+        pv_var: float,
+        arrival_rate: float,
+        obs_noise_var: float = 0.0,
+        debug: bool = False,
+        generator=None,
+        eta: float = 1.0,
+        shade_schedule_mode: str = "time",
+        episode_seed: int = 0,
+    ):
         self.agent_id = agent_id
         self.market = market
-        self.pv = SeparatedPrivateValues(q_max, val_var=pv_var, base_price=0.0, role="buyer")
+        self._generator = generator
+        self.pv = SeparatedPrivateValues(q_max, val_var=pv_var, base_price=0.0, role="buyer", generator=generator)
         self.position = 0
         self.shade = shade
+        self.shade_schedule_mode = shade_schedule_mode
+        self.eta = float(eta)
         self.cash = 0
         self.L = L
         self.grace_period = 1 / arrival_rate
         self.lower_bound_mem = 0
-        
-        # HBL tuning parameters
+
         self.buy_upper_mid_shade = 99/100
         self.buy_half_shade = 1/2
-        
+
         self.q_max = q_max
         self.pv_var = pv_var
         self.obs_noise_var = obs_noise_var
         self.debug = debug
-        
-        # Track which positions have been consumed in actual trades
-        # Each position (0, 1, 2 for q_max=3) can only be used ONCE
-        self.consumed_buy_positions = set()  # Tracks which BUY positions have been traded
+        agent_seed = (int(episode_seed) * 10_000 + int(agent_id)) & 0xFFFFFFFF
+        self._rng = random.Random(agent_seed)
+
+        self.consumed_buy_positions = set()
+        self._last_decision = {}
 
     def get_id(self) -> int:
         return self.agent_id
@@ -53,24 +74,21 @@ class HBLAgentBuy(Agent):
         t = self.market.get_time()
         val = self.market.get_fundamental_value()
         rho = (1 - r) ** (T - t)
-        estimate = (1 - rho) * mean + rho * val
+        estimate_abs = (1 - rho) * mean + rho * val
+        estimate = float(estimate_abs) - float(val)
         if self.obs_noise_var > 0:
-            estimate += np.random.normal(0, np.sqrt(self.obs_noise_var))
+            if self._generator is not None:
+                import torch
+                noise = float(torch.randn((), generator=self._generator).item()) * float(np.sqrt(self.obs_noise_var))
+                estimate += noise
+            else:
+                estimate += np.random.normal(0, np.sqrt(self.obs_noise_var))
         return estimate
 
-    def get_last_trade_time_step(self):
-        if len(self.market.matched_orders) < 2 * self.L:
-            return 0
-        last_matched_order_ind = len(self.market.matched_orders) - self.L * 2
-        earliest_order = min(
-            self.market.matched_orders[last_matched_order_ind:],
-            key=lambda matched_order: matched_order.order.time
-        ).order.time
-        return earliest_order
 
     def fast_belief_function(self, p, side, orders):
-        TBL = 0  # Transact bids less or equal
-        AL = 0  # Asks less or equal
+        TBL = 0
+        AL = 0
         for ind, order in enumerate(orders):
             if order.price <= p and order.order_type == SELL:
                 AL += order.quantity
@@ -102,10 +120,10 @@ class HBLAgentBuy(Agent):
 
     def belief_function(self, p, side, orders):
         current_time = self.market.get_time()
-        TBL = 0  # Transact bids less or equal
-        AL = 0  # Asks less or equal
-        RBG = 0  # Rejected bids greater or equal
-        
+        TBL = 0
+        AL = 0
+        RBG = 0
+
         for ind, order in enumerate(orders):
             if order.price - p <= 0 and order.order_type == SELL:
                 AL += order.quantity
@@ -137,21 +155,17 @@ class HBLAgentBuy(Agent):
                             RBG += order.quantity
                         else:
                             RBG += (time_till_withdrawal / self.grace_period) * order.quantity
-        
+
         if TBL + AL == 0:
             return 0
         else:
             return (TBL + AL) / (TBL + AL + RBG)
 
     def get_order_list(self):
-        self.lower_bound_mem = self.get_last_trade_time_step()
-        buy_orders_memory = []
-        sell_orders_memory = []
-        last_L_orders = []
-        for time in range(self.lower_bound_mem, self.market.get_time() + 1):
-            last_L_orders.extend(self.market.event_queue.scheduled_activities[time])
-        buy_orders_memory = [order for order in last_L_orders if order.order_type == BUY]
-        sell_orders_memory = [order for order in last_L_orders if order.order_type == SELL]
+        last_L_orders, buy_orders_memory, sell_orders_memory = hbl_order_memory_partition(
+            self.market, self.L
+        )
+        self.lower_bound_mem = hbl_memory_start_time(self.market, self.L)
         return last_L_orders, buy_orders_memory, sell_orders_memory
 
     def determine_optimal_price(self, side):
@@ -162,13 +176,15 @@ class HBLAgentBuy(Agent):
         sell_orders_memory = sorted(sell_orders_memory, key=lambda order: order.price)
         best_ask = float(self.market.order_book.sell_unmatched.peek())
         best_buy = float(self.market.order_book.buy_unmatched.peek())
-        
+
         spline_interp_objects = [[], []]
         private_value = self.pv.value_for_exchange(self.position, BUY)
         best_buy_belief = self.belief_function(best_buy, BUY, last_L_orders)
         best_ask_belief = 1
-        
+
         def interpolate(bound1, bound2, bound1Belief, bound2Belief):
+            if bound2 <= bound1:
+                return
             cs = FCS(bound1, bound2, [bound1Belief, bound2Belief])
             spline_interp_objects[0].append(cs)
             spline_interp_objects[1].append((bound1, bound2))
@@ -177,11 +193,11 @@ class HBLAgentBuy(Agent):
             def optimize(price):
                 for i in range(len(spline_interp_objects[0])):
                     if spline_interp_objects[1][i][0] <= price <= spline_interp_objects[1][i][1]:
-                        return -((estimate + private_value - price) * spline_interp_objects[0][i](price))
+                        return -((private_value - price) * spline_interp_objects[0][i](price))
                 return 0
 
             if len(spline_interp_objects[1]) == 0:
-                return best_ask, 0
+                return min(best_ask, private_value), max(0.0, private_value - best_ask)
 
             lb = min(spline_interp_objects[1], key=lambda bound_pair: bound_pair[0])[0]
             ub = max(spline_interp_objects[1], key=lambda bound_pair: bound_pair[1])[1]
@@ -191,7 +207,7 @@ class HBLAgentBuy(Agent):
             point_surpluses = vOptimize(test_points)
             min_index = np.argmin(point_surpluses)
             min_survey = test_points[min_index]
-            
+
             max_x = sp.optimize.minimize(vOptimize, min_survey, bounds=[[lb, ub]])
             return max_x.x.item(), -max_x.fun
 
@@ -205,7 +221,7 @@ class HBLAgentBuy(Agent):
             buy_high_belief = best_ask_belief
             buy_low = min(buy_high, buy_low)
             buy_low_belief = min(buy_high_belief, buy_low_belief)
-        
+
         if buy_high >= best_buy:
             if best_ask != buy_high:
                 interpolate(buy_high, best_ask, buy_high_belief, 1)
@@ -256,28 +272,28 @@ class HBLAgentBuy(Agent):
 
         optimal_price = expected_surplus_max()
 
-        if optimal_price[0] > estimate + private_value:
-            return estimate + private_value, -1
-        
+        if optimal_price[0] > private_value:
+            return private_value, -1
+
         return optimal_price[0], optimal_price[1]
 
     def take_action(self, seed=0):
         t = self.market.get_time()
-        random.seed(t + self.agent_id + seed)
+        self._rng.seed(t + self.agent_id + int(seed))
         estimate = self.estimate_fundamental()
         transaction_count = len(self.market.matched_orders) // 2
-        
-        # CHECK: Has this position already been consumed in a trade?
-        # If so, do NOT trade (each position can only be used once)
+        num_transactions = len(self.market.matched_orders)
+
         if self.position in self.consumed_buy_positions:
             if self.debug:
                 print(f"[HBLBuy{self.agent_id} t={t}] SKIPPED: position {self.position} already consumed")
             return []
-        
+
         private_value = self.pv.value_for_exchange(self.position, BUY)
         best_bid = self.market.order_book.buy_unmatched.peek() if self.market.order_book.buy_unmatched.peek_order() is not None else None
         best_ask = self.market.order_book.sell_unmatched.peek() if self.market.order_book.sell_unmatched.peek_order() is not None else None
-        
+
+        shade_fraction = None
         if transaction_count >= self.L and best_bid is not None and best_ask is not None:
             if getattr(self, 'position', 0) >= self.q_max:
                 if self.debug:
@@ -285,34 +301,83 @@ class HBLAgentBuy(Agent):
                 return []
             opt_price, opt_price_est_surplus = self.determine_optimal_price(BUY)
             used_fallback = False
-            
+
             if self.debug:
                 print(f"[HBLBuy{self.agent_id} t={t}] HBL MODE: estimate={estimate:.2f}, pv={private_value:.2f}, "
                       f"best_bid={best_bid:.2f}, best_ask={best_ask:.2f}, opt_price={opt_price:.2f}, "
                       f"exp_surplus={opt_price_est_surplus:.2f}, position={self.position}, txn_count={transaction_count}")
         else:
-            # ZI Agent fallback (exact ZI behavior)
             used_fallback = True
             if getattr(self, 'position', 0) >= self.q_max:
                 if self.debug:
                     print(f"[HBLBuy{self.agent_id} t={t}] SKIPPED: position={self.position} >= q_max={self.q_max}")
                 return []
-            shade_max = self.shade[1] if len(self.shade) > 1 else self.shade[0]
-            shade_amount = random.uniform(0, shade_max)
-            opt_price = estimate + private_value - shade_amount
-            
+            opt_price_est_surplus = None
+            lifted = maybe_take_best_quote_buy(
+                market=self.market,
+                buyer_value=private_value,
+                eta=self.eta,
+                agent_id=self.get_id(),
+                time=t,
+                rng=self._rng,
+            )
+            if lifted is not None:
+                opt_price = float(lifted.price)
+                self._last_decision = {
+                    "mode": "fallback_lift",
+                    "estimate_relative": float(estimate),
+                    "current_pv": float(private_value),
+                    "best_bid_relative": (None if best_bid is None else float(best_bid)),
+                    "best_ask_relative": (None if best_ask is None else float(best_ask)),
+                    "chosen_price_relative": opt_price,
+                    "expected_surplus": None,
+                    "position": int(self.position),
+                    "transaction_count": int(transaction_count),
+                }
+                return [lifted]
+
+            fundamental_now = float(
+                absolute_fundamental_estimate(
+                    self.market,
+                    obs_noise_var=self.obs_noise_var,
+                    torch_generator=getattr(self, "_generator", None),
+                    np_rng=getattr(self, "_np_rng", None),
+                )
+            )
+            opt_price, shade_fraction = zi_limit_price_buy(
+                buyer_value=private_value,
+                fundamental_now=fundamental_now,
+                shade_spec=self.shade,
+                current_time=t,
+                num_transactions=num_transactions,
+                schedule_mode=self.shade_schedule_mode,
+                rng=self._rng,
+            )
+
             if self.debug:
                 print(f"[HBLBuy{self.agent_id} t={t}] ZI FALLBACK: estimate={estimate:.2f}, pv={private_value:.2f}, "
-                      f"shade={shade_amount:.2f}, opt_price={opt_price:.2f}, position={self.position}, "
+                      f"shade_fraction={shade_fraction:.4f}, opt_price={opt_price:.2f}, position={self.position}, "
                       f"txn_count={transaction_count}, best_bid={best_bid}, best_ask={best_ask}")
-        
+        self._last_decision = {
+            "mode": "fallback" if used_fallback else "hbl",
+            "estimate_relative": float(estimate),
+            "current_pv": float(private_value),
+            "best_bid_relative": (None if best_bid is None else float(best_bid)),
+            "best_ask_relative": (None if best_ask is None else float(best_ask)),
+            "chosen_price_relative": float(opt_price),
+            "expected_surplus": (None if opt_price_est_surplus is None else float(opt_price_est_surplus)),
+            "shade_fraction": (None if shade_fraction is None else float(shade_fraction)),
+            "position": int(self.position),
+            "transaction_count": int(transaction_count),
+        }
+
         order = Order(
             price=opt_price,
             quantity=1,
             agent_id=self.get_id(),
             time=t,
             order_type=BUY,
-            order_id=random.randint(1, 10000000)
+            order_id=self._rng.randint(1, 10_000_000),
         )
         return [order]
 
@@ -320,43 +385,51 @@ class HBLAgentBuy(Agent):
         self.position += q
         self.cash += p
 
-    def reset(self):
-        self.position = 0
-        self.cash = 0
-        self.consumed_buy_positions = set()  # Reset consumed positions tracking
-        self.pv = SeparatedPrivateValues(self.q_max, val_var=self.pv_var, base_price=0.0, role="buyer")
 
-    def __str__(self):
-        return f'HBLBuy{self.agent_id}'
 
 
 class HBLAgentSell(Agent):
-    """HBL Agent that only submits sell orders. Adapted from HBLAgent."""
-    
-    def __init__(self, agent_id: int, market: Market, q_max: int, shade: List, L: int, 
-                 pv_var: float, arrival_rate: float, obs_noise_var: float = 0.0, debug: bool = False):
+    def __init__(
+        self,
+        agent_id: int,
+        market: Market,
+        q_max: int,
+        shade: Union[List, List[Tuple]],
+        L: int,
+        pv_var: float,
+        arrival_rate: float,
+        obs_noise_var: float = 0.0,
+        debug: bool = False,
+        generator=None,
+        eta: float = 1.0,
+        shade_schedule_mode: str = "time",
+        episode_seed: int = 0,
+    ):
         self.agent_id = agent_id
         self.market = market
-        self.pv = SeparatedPrivateValues(q_max, val_var=pv_var, base_price=0.0, role="seller")
+        self._generator = generator
+        self.pv = SeparatedPrivateValues(q_max, val_var=pv_var, base_price=0.0, role="seller", generator=generator)
         self.position = 0
         self.shade = shade
+        self.shade_schedule_mode = shade_schedule_mode
+        self.eta = float(eta)
         self.cash = 0
         self.L = L
         self.grace_period = 1 / arrival_rate
         self.lower_bound_mem = 0
-        
-        # HBL tuning parameters
+
         self.sell_upper_mid_shade = 99/100
         self.sell_half_shade = 1/2
-        
+
         self.q_max = q_max
         self.pv_var = pv_var
         self.obs_noise_var = obs_noise_var
         self.debug = debug
-        
-        # Track which positions have been consumed in actual trades
-        # Each position (0, 1, 2 for q_max=3) can only be used ONCE
-        self.consumed_sell_positions = set()  # Tracks which SELL positions have been traded
+        agent_seed = (int(episode_seed) * 10_000 + int(agent_id)) & 0xFFFFFFFF
+        self._rng = random.Random(agent_seed)
+
+        self.consumed_sell_positions = set()
+        self._last_decision = {}
 
     def get_id(self) -> int:
         return self.agent_id
@@ -366,24 +439,21 @@ class HBLAgentSell(Agent):
         t = self.market.get_time()
         val = self.market.get_fundamental_value()
         rho = (1 - r) ** (T - t)
-        estimate = (1 - rho) * mean + rho * val
+        estimate_abs = (1 - rho) * mean + rho * val
+        estimate = float(estimate_abs) - float(val)
         if self.obs_noise_var > 0:
-            estimate += np.random.normal(0, np.sqrt(self.obs_noise_var))
+            if self._generator is not None:
+                import torch
+                noise = float(torch.randn((), generator=self._generator).item()) * float(np.sqrt(self.obs_noise_var))
+                estimate += noise
+            else:
+                estimate += np.random.normal(0, np.sqrt(self.obs_noise_var))
         return estimate
 
-    def get_last_trade_time_step(self):
-        if len(self.market.matched_orders) < 2 * self.L:
-            return 0
-        last_matched_order_ind = len(self.market.matched_orders) - self.L * 2
-        earliest_order = min(
-            self.market.matched_orders[last_matched_order_ind:],
-            key=lambda matched_order: matched_order.order.time
-        ).order.time
-        return earliest_order
 
     def fast_belief_function(self, p, side, orders):
-        TAG = 0  # Transact ask greater or equal
-        BG = 0  # Bid greater or equal
+        TAG = 0
+        BG = 0
         for ind, order in enumerate(orders):
             if order.price >= p and order.order_type == BUY:
                 BG += order.quantity
@@ -415,9 +485,9 @@ class HBLAgentSell(Agent):
 
     def belief_function(self, p, side, orders):
         current_time = self.market.get_time()
-        TAG = 0  # Transact ask greater or equal
-        BG = 0  # Bid greater or equal
-        RAL = 0  # Reject ask less or equal
+        TAG = 0
+        BG = 0
+        RAL = 0
 
         for order in orders:
             if order.price - p >= 0 and order.order_type == BUY:
@@ -452,21 +522,17 @@ class HBLAgentSell(Agent):
                             RAL += order.quantity
                         else:
                             RAL += (time_till_withdrawal / self.grace_period) * order.quantity
-        
+
         if TAG + BG == 0:
             return 0
         else:
             return (TAG + BG) / (TAG + BG + RAL)
 
     def get_order_list(self):
-        self.lower_bound_mem = self.get_last_trade_time_step()
-        buy_orders_memory = []
-        sell_orders_memory = []
-        last_L_orders = []
-        for time in range(self.lower_bound_mem, self.market.get_time() + 1):
-            last_L_orders.extend(self.market.event_queue.scheduled_activities[time])
-        buy_orders_memory = [order for order in last_L_orders if order.order_type == BUY]
-        sell_orders_memory = [order for order in last_L_orders if order.order_type == SELL]
+        last_L_orders, buy_orders_memory, sell_orders_memory = hbl_order_memory_partition(
+            self.market, self.L
+        )
+        self.lower_bound_mem = hbl_memory_start_time(self.market, self.L)
         return last_L_orders, buy_orders_memory, sell_orders_memory
 
     def determine_optimal_price(self, side):
@@ -477,7 +543,7 @@ class HBLAgentSell(Agent):
         sell_orders_memory = sorted(sell_orders_memory, key=lambda order: order.price)
         best_ask = float(self.market.order_book.sell_unmatched.peek())
         best_buy = float(self.market.order_book.buy_unmatched.peek())
-        
+
         spline_interp_objects = [[], []]
         private_value = self.pv.value_for_exchange(self.position, SELL)
         best_buy_belief = 1
@@ -485,21 +551,23 @@ class HBLAgentSell(Agent):
         sell_high, sell_high_belief = self.find_worst_order(SELL, sorted(sell_orders_memory, key=lambda order: order.price, reverse=True), last_L_orders)
         sell_low = float(sell_orders_memory[0].price)
         sell_low_belief = self.belief_function(sell_low, SELL, last_L_orders)
-        
+
         def interpolate(bound1, bound2, bound1Belief, bound2Belief):
+            if bound2 <= bound1:
+                return
             cs = FCS(bound1, bound2, [bound1Belief, bound2Belief])
             spline_interp_objects[0].append(cs)
             spline_interp_objects[1].append((bound1, bound2))
-            
+
         def expected_surplus_max():
             def optimize(price):
                 for i in range(len(spline_interp_objects[0])):
                     if spline_interp_objects[1][i][0] <= price <= spline_interp_objects[1][i][1]:
-                        return -((price - (estimate + private_value)) * spline_interp_objects[0][i](price))
+                        return -((price - private_value) * spline_interp_objects[0][i](price))
                 return 0
 
             if len(spline_interp_objects[1]) == 0:
-                return best_buy, 0
+                return max(best_buy, private_value), max(0.0, best_buy - private_value)
 
             lb = min(spline_interp_objects[1], key=lambda bound_pair: bound_pair[0])[0]
             ub = max(spline_interp_objects[1], key=lambda bound_pair: bound_pair[1])[1]
@@ -562,7 +630,7 @@ class HBLAgentSell(Agent):
                 sell_half_belief = self.belief_function(sell_half, SELL, last_L_orders)
                 interpolate(best_buy, sell_half, best_buy_belief, sell_half_belief)
                 interpolate(sell_half, sell_mid, sell_half_belief, sell_mid_belief)
-                interpolate(sell_mid, best_ask, sell_low_belief, best_ask_belief)
+                interpolate(sell_mid, best_ask, sell_mid_belief, best_ask_belief)
             if best_ask != sell_low:
                 interpolate(best_ask, sell_low, best_ask_belief, sell_low_belief)
             if sell_low != sell_high:
@@ -570,32 +638,32 @@ class HBLAgentSell(Agent):
             if sell_high_belief > 0:
                 upper_bound = sell_high + 2 * (sell_high - best_buy) + 1
                 interpolate(sell_high, upper_bound, sell_high_belief, 0)
-        
+
         optimal_price = expected_surplus_max()
 
-        if optimal_price[0] < estimate + private_value:
-            return estimate + private_value, 0
-        
+        if optimal_price[0] < private_value:
+            return private_value, 0
+
         return optimal_price[0], optimal_price[1]
 
     def take_action(self, seed=0):
         t = self.market.get_time()
-        random.seed(t + self.agent_id + seed)
+        self._rng.seed(t + self.agent_id + int(seed))
         estimate = self.estimate_fundamental()
         transaction_count = len(self.market.matched_orders) // 2
-        
-        # CHECK: Has this position already been consumed in a trade?
-        # If so, do NOT trade (each position can only be used once)
+        num_transactions = len(self.market.matched_orders)
+
         sell_index = abs(self.position)
         if sell_index in self.consumed_sell_positions:
             if self.debug:
                 print(f"[HBLSell{self.agent_id} t={t}] SKIPPED: position {self.position} already consumed")
             return []
-        
+
         private_value = self.pv.value_for_exchange(self.position, SELL)
         best_bid = self.market.order_book.buy_unmatched.peek() if self.market.order_book.buy_unmatched.peek_order() is not None else None
         best_ask = self.market.order_book.sell_unmatched.peek() if self.market.order_book.sell_unmatched.peek_order() is not None else None
-        
+
+        shade_fraction = None
         if transaction_count >= self.L and best_bid is not None and best_ask is not None:
             if getattr(self, 'position', 0) <= -self.q_max:
                 if self.debug:
@@ -603,33 +671,83 @@ class HBLAgentSell(Agent):
                 return []
             opt_price, opt_price_est_surplus = self.determine_optimal_price(SELL)
             used_fallback = False
-            
+
             if self.debug:
                 print(f"[HBLSell{self.agent_id} t={t}] HBL MODE: estimate={estimate:.2f}, pv={private_value:.2f}, "
                       f"best_bid={best_bid:.2f}, best_ask={best_ask:.2f}, opt_price={opt_price:.2f}, "
                       f"exp_surplus={opt_price_est_surplus:.2f}, position={self.position}, txn_count={transaction_count}")
         else:
-            # ZI Agent fallback (exact ZI behavior)
             used_fallback = True
             if getattr(self, 'position', 0) <= -self.q_max:
                 if self.debug:
                     print(f"[HBLSell{self.agent_id} t={t}] SKIPPED: position={self.position} <= -q_max={-self.q_max}")
                 return []
-            shade_amount = random.uniform(0, self.shade[1])
-            opt_price = estimate + private_value + shade_amount
-            
+            opt_price_est_surplus = None
+            lifted = maybe_take_best_quote_sell(
+                market=self.market,
+                seller_cost=private_value,
+                eta=self.eta,
+                agent_id=self.get_id(),
+                time=t,
+                rng=self._rng,
+            )
+            if lifted is not None:
+                opt_price = float(lifted.price)
+                self._last_decision = {
+                    "mode": "fallback_lift",
+                    "estimate_relative": float(estimate),
+                    "current_pv": float(private_value),
+                    "best_bid_relative": (None if best_bid is None else float(best_bid)),
+                    "best_ask_relative": (None if best_ask is None else float(best_ask)),
+                    "chosen_price_relative": opt_price,
+                    "expected_surplus": None,
+                    "position": int(self.position),
+                    "transaction_count": int(transaction_count),
+                }
+                return [lifted]
+
+            fundamental_now = float(
+                absolute_fundamental_estimate(
+                    self.market,
+                    obs_noise_var=self.obs_noise_var,
+                    torch_generator=getattr(self, "_generator", None),
+                    np_rng=getattr(self, "_np_rng", None),
+                )
+            )
+            opt_price, shade_fraction = zi_limit_price_sell(
+                seller_cost=private_value,
+                fundamental_now=fundamental_now,
+                shade_spec=self.shade,
+                current_time=t,
+                num_transactions=num_transactions,
+                schedule_mode=self.shade_schedule_mode,
+                rng=self._rng,
+            )
+
             if self.debug:
                 print(f"[HBLSell{self.agent_id} t={t}] ZI FALLBACK: estimate={estimate:.2f}, pv={private_value:.2f}, "
-                      f"shade={shade_amount:.2f}, opt_price={opt_price:.2f}, position={self.position}, "
+                      f"shade_fraction={shade_fraction:.4f}, opt_price={opt_price:.2f}, position={self.position}, "
                       f"txn_count={transaction_count}, best_bid={best_bid}, best_ask={best_ask}")
-        
+        self._last_decision = {
+            "mode": "fallback" if used_fallback else "hbl",
+            "estimate_relative": float(estimate),
+            "current_pv": float(private_value),
+            "best_bid_relative": (None if best_bid is None else float(best_bid)),
+            "best_ask_relative": (None if best_ask is None else float(best_ask)),
+            "chosen_price_relative": float(opt_price),
+            "expected_surplus": (None if opt_price_est_surplus is None else float(opt_price_est_surplus)),
+            "shade_fraction": (None if shade_fraction is None else float(shade_fraction)),
+            "position": int(self.position),
+            "transaction_count": int(transaction_count),
+        }
+
         order = Order(
             price=opt_price,
             quantity=1,
             agent_id=self.get_id(),
             time=t,
             order_type=SELL,
-            order_id=random.randint(1, 10000000)
+            order_id=self._rng.randint(1, 10_000_000),
         )
         return [order]
 
@@ -637,11 +755,4 @@ class HBLAgentSell(Agent):
         self.position += q
         self.cash += p
 
-    def reset(self):
-        self.position = 0
-        self.cash = 0
-        self.consumed_sell_positions = set()  # Reset consumed positions tracking
-        self.pv = SeparatedPrivateValues(self.q_max, val_var=self.pv_var, base_price=0.0, role="seller")
 
-    def __str__(self):
-        return f'HBLSell{self.agent_id}'

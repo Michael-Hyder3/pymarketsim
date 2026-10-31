@@ -51,3 +51,7 @@ llm_calls/
 llm_calls_*/
 llm_generalization_*/
 marketsim/LLM/reflection_pipeline/runs/
+archive/marketsim/LLM/reflection_pipeline/runs/
+
+# Local-only holding pen for non-pipeline code (do not publish)
+archive/

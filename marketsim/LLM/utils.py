@@ -7,6 +7,14 @@ import warnings
 
 
 
+
+def existing_path(path: Optional[str]) -> Optional[Path]:
+    if path is None:
+        return None
+    candidate = Path(path)
+    return candidate if candidate.exists() else None
+
+
 def load_json_if_exists(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if path is None or not path.exists():
         return None
