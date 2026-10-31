@@ -9,7 +9,7 @@ _ACTIVE_PROFILE = DEFAULT_PROMPT_PROFILE
 
 
 def activate_prompt_profile(profile: Optional[str] = None) -> str:
-    """Activate a prompt stack. Only ``standard`` is available in this repo."""
+    """Activate the prompt stack."""
     global _ACTIVE_PROFILE
     name = (profile or DEFAULT_PROMPT_PROFILE).strip().lower()
     if name not in PROMPT_PROFILES:

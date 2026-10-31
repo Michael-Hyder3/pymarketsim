@@ -306,9 +306,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="standard",
         choices=["standard"],
-        help=(
-            "Prompt stack. Only standard is available (live prompts.py / pipeline.py)."
-        ),
+        help="Prompt stack.",
     )
     parser.add_argument(
         "--lob-input-mode",
