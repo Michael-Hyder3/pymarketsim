@@ -55,3 +55,6 @@ archive/marketsim/LLM/reflection_pipeline/runs/
 
 # Local-only holding pen for non-pipeline code (do not publish)
 archive/
+
+# Generated holdout dumps (scripts under reproduce/ only)
+reproduce/results/

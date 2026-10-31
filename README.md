@@ -1,55 +1,46 @@
-# PyMarketSim (LLM Feedback-Loop Pipeline)
+# PyMarketSim
 
-This repo contains market simulation code plus an LLM-driven feedback loop that iteratively generates and evaluates trading strategies.
+Market simulation plus an LLM reflection pipeline that creates CDA shade programs (PV, Sp, LOB).
 
-## What you need
+Layout:
 
-- Python 3.10+
-- A virtual environment
-- Dependencies from `requirements.txt`
-- `openai` Python client (used by `marketsim/LLM/code_generator.py`)
-- Access to an OpenAI-compatible LLM endpoint (local or remote)
+- `marketsim/` — simulator and reflection pipeline
+- `scripts/` — creation run entrypoints
+- `reproduce/` — holdout / table helpers (separate from the pipeline package; no result dumps in git)
 
-## Quick setup
+## Setup
 
 ```bash
-cd pymarketsim
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install openai
 ```
 
-## LLM path / endpoint
+LLM endpoint (OpenAI-compatible), via env vars only:
 
-The pipeline uses OpenAI-compatible API settings from environment variables:
+- `OPENAI_BASE_URL`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL` (optional; code default is a local Llama-3 instruct id)
 
-- `OPENAI_BASE_URL` (example: `http://127.0.0.1:8000/v1`)
-- `OPENAI_API_KEY` (any non-empty value for local vLLM setups)
-- `OPENAI_MODEL` (default in code: `models/Meta-Llama-3-8B-Instruct`)
+## Creation runs
 
-In this workspace, model files are located at:
-
-`LLama 3/models/Meta-Llama-3-8B-Instruct`
-
-If your serving stack uses a different model ID, set `OPENAI_MODEL` to that exact served name.
-
-## Run the current pipeline
-
-Run from repo root:
+From the repo root:
 
 ```bash
-cd pymarketsim
-source .venv/bin/activate
-python marketsim/LLM/tests/test_feedback_loop.py --episodes 10 --pv-mode fixed --seed 100
+./scripts/create_pv.sh
+./scripts/create_sp.sh
+./scripts/create_lob.sh
 ```
 
-Outputs are written to:
+These call `python -m marketsim.LLM.reflection_pipeline` with the paper recipes.
+Only the **standard** prompt stack is available (`--prompt-profile standard`).
 
-- `llm_calls/` (generated code + metadata)
-- `results/baseline_only_test.json` (run summary)
+## Holdout / tables (no LLM)
 
-## Notes
+See `reproduce/README.md`. Short path:
 
-- The active simulation backend module is `marketsim/LLM/mixed_market_simulator.py`.
-- If imports fail, make sure you are running from the repository root.
+```bash
+python reproduce/holdout_eval.py {pv,sp,lob} {ood,id}
+python reproduce/best_constant.py {pv,sp,lob}
+python reproduce/stats.py
+```

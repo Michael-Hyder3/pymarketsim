@@ -305,11 +305,9 @@ def parse_args() -> argparse.Namespace:
         "--prompt-profile",
         type=str,
         default="standard",
-        choices=["standard", "slim"],
+        choices=["standard"],
         help=(
-            "Prompt stack: standard (default; zipparity / pre-slim prompts) or slim "
-            "(narrowed data→hypothesis→refine prompts preserved under "
-            "prompt_profiles/slim/)."
+            "Prompt stack. Only standard is available (live prompts.py / pipeline.py)."
         ),
     )
     parser.add_argument(

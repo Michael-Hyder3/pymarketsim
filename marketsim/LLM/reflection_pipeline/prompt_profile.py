@@ -1,33 +1,18 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
-PROMPT_PROFILES = ("standard", "slim")
+PROMPT_PROFILES = ("standard",)
 DEFAULT_PROMPT_PROFILE = "standard"
 
-_PROFILES_DIR = Path(__file__).resolve().parent / "prompt_profiles"
 _ACTIVE_PROFILE = DEFAULT_PROMPT_PROFILE
 
-_SYSTEM_PROMPT_ATTRS = (
-    "CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM",
-    "CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_LOB",
-    "CRITIC_SYSTEM_PROMPT_STRUCTURED_PRINCIPLE_FORM_SPREAD",
-)
 
-
-
-
-
-
-
-
-def activate_prompt_profile(profile: str) -> str:
+def activate_prompt_profile(profile: Optional[str] = None) -> str:
+    """Activate a prompt stack. Only ``standard`` is available in this repo."""
     global _ACTIVE_PROFILE
     name = (profile or DEFAULT_PROMPT_PROFILE).strip().lower()
-    if name != "standard":
+    if name not in PROMPT_PROFILES:
         raise ValueError(
             f"Unknown prompt profile {profile!r}; expected one of {PROMPT_PROFILES}"
         )
